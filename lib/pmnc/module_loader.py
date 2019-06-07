@@ -6,7 +6,7 @@
 # accessible from all modules as pmnc and is essentialy the running cage itself.
 #
 # Pythomnic3k project
-# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -143,7 +143,7 @@ class Module:
         if name.startswith("_"):
             raise InvalidMethodAccessError("attribute {0:s} should be private to module "
                                            "{1:s}".format(name, self._name))
-        dynamic_lookup = "__getattr__" in self._module.__all__
+        dynamic_lookup = "__get_module_attr__" in self._module.__all__
         if name not in self._module.__all__ and not dynamic_lookup:
             raise InvalidMethodAccessError("attribute {0:s} is not declared in __all__ "
                                            "list of module {1:s}".format(name, self._name))
@@ -159,9 +159,9 @@ class Module:
                 except AttributeError:
                     if not dynamic_lookup:
                         raise
-                    get_attr = getattr(self._module, "__getattr__")
+                    get_attr = getattr(self._module, "__get_module_attr__")
                     if not isfunction(get_attr):
-                        raise InvalidMethodAccessError("attribute __getattr__ in module {0:s} "
+                        raise InvalidMethodAccessError("attribute __get_module_attr__ in module {0:s} "
                                                        "is not a function".format(self._name))
                     attr = get_attr(name, __source_module_name = source_module_name)
 
@@ -697,6 +697,7 @@ if __name__ == "__main__":
     from subprocess import Popen
     from pmnc.request import InfiniteRequest, fake_request
     from typecheck import either, InputParameterError, ReturnValueError
+    from re import compile as regex
 
     ###################################
 
@@ -744,6 +745,36 @@ if __name__ == "__main__":
         sleep(2.0)
         with open(os_path.join(cage_dir, name), "wb") as f:
             f.write(contents.encode(encoding))
+
+    ###################################
+
+    remain_regex = regex("^(.*)\\+([0-9]+\\.[0-9])s$")
+    line_number_regex = regex("\\.py:[0-9]+\\) ")
+
+    def compare_log_lines(el1, el2):
+        for s1, s2 in zip(el1, el2):
+            s1 = line_number_regex.sub(".py:?) ", s1)
+            s2 = line_number_regex.sub(".py:?) ", s2)
+            if s1 != s2:
+                m1 = remain_regex.match(s1)
+                m2 = remain_regex.match(s2)
+                if m1 is not None and m2 is not None:
+                    r1 = m1.group(2)
+                    r2 = m2.group(2)
+                    if abs(float(r1) - float(r2)) < 1.0:
+                        s2 = remain_regex.sub("\\1+" + r1 + "s", s2)
+            if s1 != s2:
+                print()
+                print("---")
+                print(s1)
+                print(s2)
+                for i, (c1, c2) in enumerate(zip(s1, s2)):
+                    print(c1 == c2 and " " or "^", end = "")
+                print()
+                print("---")
+                raise AssertionError()
+        if len(el1) != len(el2):
+            raise AssertionError()
 
     ###################################
 
@@ -869,13 +900,13 @@ if __name__ == "__main__":
                             "declared in __all__ list of module foo")):
         pmnc.foo.bar
 
-    with expected(AttributeError("'module' object has no attribute 'not_there'")):
+    with expected(AttributeError, ".*not_there.*"):
         pmnc.foo.not_there
 
     # dynamic lookup
 
     write_module(os_path.join("..", ".shared", "foo.py"),
-                 "__all__ = ['__getattr__', 'foo']\n"
+                 "__all__ = ['__get_module_attr__', 'foo']\n"
                  "from typecheck import either\n"
                  "def foo(arg: either(str, int), *, __source_module_name) -> int:\n"
                  "    assert __source_module_name == '__main__'\n"
@@ -883,7 +914,7 @@ if __name__ == "__main__":
                  "def bar(arg: either(str, int), *, __source_module_name) -> str:\n"
                  "    assert __source_module_name == '__main__'\n"
                  "    return arg\n"
-                 "def __getattr__(name, *, __source_module_name):\n"
+                 "def __get_module_attr__(name, *, __source_module_name):\n"
                  "    assert __source_module_name == '__main__'\n"
                  "    if name == 'bar':\n"
                  "        return bar\n"
@@ -908,19 +939,19 @@ if __name__ == "__main__":
     # complex dynamic lookup
 
     write_module(os_path.join("..", ".shared", "foo.py"),
-                 "__all__ = ['__getattr__']\n"
+                 "__all__ = ['__get_module_attr__']\n"
                  "def wrap(name, *, __source_module_name):\n"
                  "    def wrapped():\n"
                  "        return name, __source_module_name\n"
                  "    return wrapped\n"
-                 "def __getattr__(name, *, __source_module_name):\n"
+                 "def __get_module_attr__(name, *, __source_module_name):\n"
                  "    assert __source_module_name == 'bar'\n"
                  "    if name == 'wrap': return wrap\n"
                  "# EOF")
 
     write_module(os_path.join("..", ".shared", "bar.py"),
-                 "__all__ = ['__getattr__']\n"
-                 "def __getattr__(name, *, __source_module_name):\n"
+                 "__all__ = ['__get_module_attr__']\n"
+                 "def __get_module_attr__(name, *, __source_module_name):\n"
                  "    assert __source_module_name == '__main__'\n"
                  "    return pmnc.foo.wrap(name)\n"
                  "# EOF")
@@ -930,8 +961,8 @@ if __name__ == "__main__":
     # dynamic lookup vs. conventional lookup
 
     write_module(os_path.join("..", ".shared", "biz.py"),
-                 "__all__ = ['__getattr__', 'have']\n"
-                 "def __getattr__(name, *, __source_module_name):\n"
+                 "__all__ = ['__get_module_attr__', 'have']\n"
+                 "def __get_module_attr__(name, *, __source_module_name):\n"
                  "    if name == 'provide':\n"
                  "        return provide\n"
                  "    else:\n"
@@ -1332,7 +1363,10 @@ if __name__ == "__main__":
 
     del log_lines[:]
     pmnc.logs.log()
-    assert log_lines[-1] == "ERROR 1 b'bytes' Foo # logs.py:6 in log() by {0:s}".format(r.description)
+    compare_log_lines(log_lines[-1:],
+    [
+        "ERROR 1 b'bytes' Foo # logs.py:6 in log() by {0:s}".format(r.description)
+    ])
 
     print("ok")
 
@@ -1405,7 +1439,8 @@ if __name__ == "__main__":
     r = fake_request(30.0)
     pmnc.logging.test_global_level()
     suffix = " in test_global_level() by {0:s}".format(r.description)
-    assert log_lines[-8:] == \
+
+    compare_log_lines(log_lines[-8:],
     [
 
         "ERROR # logging.py:5" + suffix,
@@ -1417,7 +1452,7 @@ if __name__ == "__main__":
         "NOISE # logging.py:11" + suffix,
 
         "*** FLUSH ***"
-    ]
+    ])
 
     loader.set_log_level("ERROR")
 
@@ -1425,9 +1460,9 @@ if __name__ == "__main__":
     r = fake_request(30.0)
     pmnc.logging.test_global_level()
     suffix = " in test_global_level() by {0:s}".format(r.description)
-    assert log_lines[-2:] == [
+    compare_log_lines(log_lines[-2:], [
         "ERROR # logging.py:5" + suffix,
-        "*** FLUSH ***" ]
+        "*** FLUSH ***" ])
 
     # setting log level on per request basis
 
@@ -1483,7 +1518,7 @@ if __name__ == "__main__":
         "*** FLUSH ***",
 
     ]
-    assert log_lines[-len(_log_lines):] == _log_lines
+    compare_log_lines(log_lines[-len(_log_lines):], _log_lines)
 
     del log_lines[:]
     r = fake_request(30.0)
@@ -1535,7 +1570,7 @@ if __name__ == "__main__":
         "*** FLUSH ***",
 
     ]
-    assert log_lines[-len(_log_lines):] == _log_lines
+    compare_log_lines(log_lines[-len(_log_lines):], _log_lines)
 
     loader.set_log_level("MESSAGE")
 
@@ -1589,7 +1624,7 @@ if __name__ == "__main__":
         "*** FLUSH ***",
 
     ]
-    assert log_lines[-len(_log_lines):] == _log_lines
+    compare_log_lines(log_lines[-len(_log_lines):], _log_lines)
 
     del log_lines[:]
     r = fake_request(30.0)
@@ -1641,7 +1676,7 @@ if __name__ == "__main__":
         "*** FLUSH ***",
 
     ]
-    assert log_lines[-len(_log_lines):] == _log_lines
+    compare_log_lines(log_lines[-len(_log_lines):], _log_lines)
 
     loader.set_log_level("DEBUG")
 
@@ -1692,7 +1727,7 @@ if __name__ == "__main__":
         "LOG # cond_logging.py:10" + suffix,
         "LOG LOG # cond_logging.py:11" + suffix,
     ]
-    assert log_lines[-len(_log_lines):] == _log_lines
+    compare_log_lines(log_lines[-len(_log_lines):], _log_lines)
 
     loader.set_log_level("DEBUG")
 
@@ -1903,7 +1938,7 @@ if __name__ == "__main__":
                  "\n"
                  "# EOF")
 
-    with expected(AttributeError("'module' object has no attribute 'notthere'")):
+    with expected(AttributeError, ".*notthere.*"):
         pmnc.foo.notthere
 
     with expected(InvalidMethodAccessError("attribute biz in module foo is neither a class nor a function")):
@@ -1986,7 +2021,7 @@ if __name__ == "__main__":
     assert pmnc.mod1.test() == "mod1.test1"
 
     suffix = " by {0:s}".format(r.description)
-    assert log_lines == \
+    compare_log_lines(log_lines,
     [
         "loading module __module_loader__ from " + module_loader_py + " #" + suffix,
         "module __module_loader__ has been loaded #" + suffix,
@@ -1996,7 +2031,7 @@ if __name__ == "__main__":
         "loading module mod1 from " + mod1_py + " #" + suffix,
         "module mod1 has been loaded #" + suffix,
         "mod1 # __module_loader__.py:7 in after_reload()" + suffix,
-    ]
+    ])
 
     # __module_loader__ is changed but is not reloaded, mod1 returns the same result
 
@@ -2030,11 +2065,11 @@ if __name__ == "__main__":
         pmnc.mod1.test()
 
     suffix = " by {0:s}".format(r.description)
-    assert log_lines == \
+    compare_log_lines(log_lines,
     [
         "reloading module __module_loader__ from " + module_loader_py + " #" + suffix,
         "module __module_loader__ has been reloaded #" + suffix,
-    ]
+    ])
 
     # __module_loader__ is partially repaired and reloaded
 
@@ -2060,14 +2095,14 @@ if __name__ == "__main__":
     assert pmnc.mod1.test() == "mod1.test1"
 
     suffix = " by {0:s}".format(r.description)
-    assert log_lines == \
+    compare_log_lines(log_lines,
     [
         "reloading module __module_loader__ from " + module_loader_py + " #" + suffix,
         "module __module_loader__ has been reloaded #" + suffix,
         "reloading module mod1 from " + mod1_py + " #" + suffix,
         "reloading of module mod1 failed: file " + mod1_py + " is broken: name 'not_defined' is not defined (the error is ignored) #" + suffix,
-        'application error after reloading of module mod1: KeyError("\'not there\'") in after_reload() (__module_loader__.py:5) <- __call__() (module_loader.py:89) <- _after_reload() (module_loader.py:492) (the error is ignored) #' + suffix,
-    ]
+        'application error after reloading of module mod1: KeyError("\'not there\'") in after_reload() (__module_loader__.py:5) <- __call__() (module_loader.py:89) <- _after_reload() (module_loader.py:489) (the error is ignored) #' + suffix,
+    ])
 
     # __module_loader__ is now repaired in cage directory
 
@@ -2098,11 +2133,11 @@ if __name__ == "__main__":
     assert pmnc.mod1.test() == "replacement module"
 
     suffix = " by {0:s}".format(r.description)
-    assert log_lines[:2] == \
+    compare_log_lines(log_lines[:2],
     [
         "reloading module __module_loader__ from " + os_path.join(cage_dir, "__module_loader__.py") + " #" + suffix,
         "module __module_loader__ has been reloaded #" + suffix,
-    ]
+    ])
     assert log_lines[2].startswith("reloading module mod1 from") and log_lines[2].endswith(" #" + suffix)
     assert log_lines[3] == "module mod1 has been reloaded #" + suffix
     assert len(log_lines) == 4

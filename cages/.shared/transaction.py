@@ -153,12 +153,12 @@
 # Callable to override cache put behaviour altogether.
 #
 # Pythomnic3k project
-# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
 
-__all__ = [ "create", "Transaction", "__getattr__" ]
+__all__ = [ "create", "Transaction", "__get_module_attr__" ]
 
 ################################################################################
 
@@ -731,7 +731,7 @@ class Transaction:
 
 ###############################################################################
 
-def __getattr__(resource_name, *, __source_module_name):
+def __get_module_attr__(resource_name, *, __source_module_name):
 
     # this method executes a transaction with a single participant
 
