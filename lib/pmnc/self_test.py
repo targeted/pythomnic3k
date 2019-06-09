@@ -165,7 +165,7 @@ def _start_pmnc(test_cages_dir):
     Request._self_test = main_module_name
     fake_request()
 
-    loader = ModuleLoader(node_name, cage_name, test_cage_dir, _log, "NOISE", 0.5, 0.0)
+    loader = ModuleLoader(node_name, cage_name, test_cage_dir, _log, "NOISE", 0.0, 0.0)
     pmnc = ModuleLoaderProxy(loader, __name__)
 
     try:
