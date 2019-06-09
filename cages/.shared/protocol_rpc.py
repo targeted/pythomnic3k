@@ -80,7 +80,7 @@
 # )
 #
 # Pythomnic3k project
-# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -108,8 +108,6 @@ except ImportError:
     have_reuse_port = False
 else:
     have_reuse_port = True
-import sys; from sys import version_info
-advanced_ssl_options = version_info[:2] >= (3, 2)
 try:
     import umsgpack; from umsgpack import load as unmsgpack, dumps as msgpack
 except ImportError:
@@ -348,8 +346,8 @@ class Interface: # RPC interface
 
         ssl_key_cert_file = _locate_key_file("key_cert.pem")
         ssl_ca_cert_file = _locate_key_file("ca_cert.pem")
-        ssl_ciphers = advanced_ssl_options and "HIGH:!aNULL:!MD5" or None
-        ssl_protocol = advanced_ssl_options and "TLSv1" or None
+        ssl_ciphers = "HIGH:!aNULL:!MD5"
+        ssl_protocol = "TLSv1"
 
         if pmnc.request.self_test == __name__: # self-test
             self.process_request = kwargs["process_request"]
@@ -921,8 +919,8 @@ class Resource(TransactionalResource): # RPC resource
         if discovered_location.startswith("ssl://"):
             ssl_key_cert_file = _locate_key_file("key_cert.pem")
             ssl_ca_cert_file = _locate_key_file("ca_cert.pem")
-            ssl_ciphers = advanced_ssl_options and "HIGH:!aNULL:!MD5" or None
-            ssl_protocol = advanced_ssl_options and "TLSv1" or None
+            ssl_ciphers = "HIGH:!aNULL:!MD5"
+            ssl_protocol = "TLSv1"
         elif discovered_location.startswith("tcp://"):
             ssl_key_cert_file = None
             ssl_ca_cert_file = None
@@ -935,7 +933,9 @@ class Resource(TransactionalResource): # RPC resource
                                              ssl_key_cert_file = ssl_key_cert_file,
                                              ssl_ca_cert_file = ssl_ca_cert_file,
                                              ssl_ciphers = ssl_ciphers,
-                                             ssl_protocol = ssl_protocol)
+                                             ssl_protocol = ssl_protocol,
+                                             ssl_server_hostname = None,
+                                             ssl_ignore_hostname = True)
 
     ###################################
 
@@ -1044,6 +1044,9 @@ class Resource(TransactionalResource): # RPC resource
 
 def self_test():
 
+    if not have_msgpack:
+        raise Exception("umsgpack.py is required to test this module")
+
     from time import sleep
     from expected import expected
     from pmnc.request import fake_request
@@ -1058,7 +1061,6 @@ def self_test():
 
         global have_msgpack
 
-        assert have_msgpack # otherwise we'd have import error above
         assert _filter_marshaling_methods(None) == ("msgpack", "pickle")
         assert _filter_marshaling_methods(("pickle", )) == ("pickle", )
         assert _filter_marshaling_methods(("msgpack", )) == ("msgpack", )

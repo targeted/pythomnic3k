@@ -17,7 +17,9 @@
 # ssl_key_cert_file = None,                           # ssl, optional filename
 # ssl_ca_cert_file = None,                            # ssl, optional filename
 # ssl_ciphers = None,                                 # ssl, optional str
-# ssl_protocol = None,                                # ssl, optional "SSLv23", "TLSv1", "TLSv1_1" or "TLSv1_2"
+# ssl_protocol = None,                                # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+# ssl_server_hostname = None,                         # ssl, optional str
+# ssl_ignore_hostname = False,                        # ssl, ignore certificate common/alt name name mismatch
 # interval = 30.0,                                    # email
 # username = "user",                                  # email
 # password = "pass",                                  # email
@@ -40,7 +42,9 @@
 # ssl_key_cert_file = None,                           # ssl, optional filename
 # ssl_ca_cert_file = None,                            # ssl, optional filename
 # ssl_ciphers = None,                                 # ssl, optional str
-# ssl_protocol = None,                                # ssl, optional "SSLv23", "TLSv1", "TLSv1_1" or "TLSv1_2"
+# ssl_protocol = None,                                # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+# ssl_server_hostname = None,                         # ssl, optional str
+# ssl_ignore_hostname = False,                        # ssl, ignore certificate common/alt name name mismatch
 # encoding = "windows-1251",                          # email
 # helo = "hostname",                                  # email
 # auth_method = None,                                 # email, optional "PLAIN" or "LOGIN"
@@ -76,7 +80,7 @@
 # as cid:{filename} which is replaced with a proper unique Content-ID.
 #
 # Pythomnic3k project
-# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -161,7 +165,9 @@ class Interface: # email (POP3) interface
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
-                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2")) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
+                 ssl_server_hostname: optional(str) = None,
+                 ssl_ignore_hostname: optional(bool) = False,
                  username: str,
                  password: str,
                  interval: float,
@@ -176,6 +182,8 @@ class Interface: # email (POP3) interface
         self._ssl_ca_cert_file = ssl_ca_cert_file
         self._ssl_ciphers = ssl_ciphers
         self._ssl_protocol = ssl_protocol
+        self._ssl_server_hostname = ssl_server_hostname
+        self._ssl_ignore_hostname = ssl_ignore_hostname
         self._username = username
         self._password = password
         self._interval = interval
@@ -235,7 +243,9 @@ class Interface: # email (POP3) interface
                                                            ssl_key_cert_file = self._ssl_key_cert_file,
                                                            ssl_ca_cert_file = self._ssl_ca_cert_file,
                                                            ssl_ciphers = self._ssl_ciphers,
-                                                           ssl_protocol = self._ssl.protocol)
+                                                           ssl_protocol = self._ssl_protocol,
+                                                           ssl_server_hostname = self._ssl_server_hostname,
+                                                           ssl_ignore_hostname = self._ssl_ignore_hostname)
                 self._pop3.connect()
                 try:
 
@@ -631,7 +641,9 @@ class Resource(TransactionalResource): # email (SMTP) resource
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
-                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2")) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
+                 ssl_server_hostname: optional(str) = None,
+                 ssl_ignore_hostname: optional(bool) = False,
                  encoding: str,
                  helo: str,
                  auth_method: optional(one_of("PLAIN", "LOGIN")) = "PLAIN",
@@ -653,7 +665,9 @@ class Resource(TransactionalResource): # email (SMTP) resource
                                           ssl_key_cert_file = ssl_key_cert_file,
                                           ssl_ca_cert_file = ssl_ca_cert_file,
                                           ssl_ciphers = ssl_ciphers,
-                                          ssl_protocol = ssl_protocol)
+                                          ssl_protocol = ssl_protocol,
+                                          ssl_server_hostname = ssl_server_hostname,
+                                          ssl_ignore_hostname = ssl_ignore_hostname)
 
     ###################################
 
@@ -817,14 +831,16 @@ def self_test():
     test_interface_config = dict \
     (
     protocol = "email",
-    server_address = ("mail.domain.com", 110),
+    server_address = ("mail.targeted.org", 110),
     connect_timeout = 3.0,
     ssl_key_cert_file = None,
     ssl_ca_cert_file = None,
     ssl_ciphers = None,
     ssl_protocol = None,
-    username = "to",   # recipient's POP3 username
-    password = "pass", # recipient's POP3 password
+    ssl_server_hostname = None,
+    ssl_ignore_hostname = False,
+    username = "test2@targeted.org", # recipient's POP3 username
+    password = "aaatest2", # recipient's POP3 password
     interval = 3.0,
     )
 
@@ -835,8 +851,8 @@ def self_test():
 
     ###################################
 
-    from_addr = "from@domain.com" # sender's address
-    to_addr = "to@domain.com"     # recipient's address
+    from_addr = "test1@targeted.org" # sender's address
+    to_addr = "test2@targeted.org"   # recipient's address
 
     russian = "¿¡¬√ƒ≈®∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ‹€⁄›ﬁﬂ‡·‚„‰Â∏ÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘¸˚˙˝˛ˇ"
 

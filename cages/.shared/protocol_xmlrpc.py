@@ -15,7 +15,7 @@
 # ssl_key_cert_file = None,                                  # ssl, optional filename
 # ssl_ca_cert_file = None,                                   # ssl, optional filename
 # ssl_ciphers = None,                                        # ssl, optional str
-# ssl_protocol = None,                                       # ssl, optional "SSLv23", "TLSv1", "TLSv1_1" or "TLSv1_2"
+# ssl_protocol = None,                                       # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
 # response_encoding = "windows-1251",                        # http
 # original_ip_header_fields = ("X-Forwarded-For", ),         # http
 # keep_alive_support = True,                                 # http
@@ -42,7 +42,9 @@
 # ssl_key_cert_file = None,                                  # ssl, optional filename
 # ssl_ca_cert_file = None,                                   # ssl, optional filename
 # ssl_ciphers = None,                                        # ssl, optional str
-# ssl_protocol = None,                                       # ssl, optional "SSLv23", "TLSv1", "TLSv1_1" or "TLSv1_2"
+# ssl_protocol = None,                                       # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+# ssl_server_hostname = None,                                # ssl, optional str
+# ssl_ignore_hostname = False,                               # ssl, ignore certificate common/alt name name mismatch
 # extra_headers = { "Authorization": "Basic dXNlcjpwYXNz" }, # http
 # http_version = "HTTP/1.1",                                 # http
 # server_uri = "/xmlrpc",                                    # xmlrpc
@@ -61,7 +63,7 @@
 # result = pmnc.transaction.xmlrpc_1.Module.Method(*args)
 #
 # Pythomnic3k project
-# (c) 2005-2016, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -94,7 +96,7 @@ class Interface: # XMLRPC interface built on top of HTTP interface
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
-                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2")) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
                  response_encoding: str,
                  original_ip_header_fields: tuple_of(str),
                  keep_alive_support: bool,
@@ -240,7 +242,9 @@ class Resource(TransactionalResource): # XMLRPC resource
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
-                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2")) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
+                 ssl_server_hostname: optional(str) = None,
+                 ssl_ignore_hostname: optional(bool) = False,
                  extra_headers: dict_of(str, str),
                  http_version: str,
                  server_uri: str,
@@ -261,6 +265,8 @@ class Resource(TransactionalResource): # XMLRPC resource
                                         ssl_ca_cert_file = ssl_ca_cert_file,
                                         ssl_ciphers = ssl_ciphers,
                                         ssl_protocol = ssl_protocol,
+                                        ssl_server_hostname = ssl_server_hostname,
+                                        ssl_ignore_hostname = ssl_ignore_hostname,
                                         extra_headers = extra_headers,
                                         http_version = http_version)
 

@@ -14,7 +14,9 @@ connect_timeout = 3.0,                        # tcp
 ssl_key_cert_file = None,                     # ssl, optional filename
 ssl_ca_cert_file = None,                      # ssl, optional filename
 ssl_ciphers = None,                           # ssl, optional str
-ssl_protocol = None,                          # ssl, optional "SSLv23", "TLSv1", "TLSv1_1" or "TLSv1_2"
+ssl_protocol = None,                          # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+ssl_server_hostname = None,                   # ssl, optional str
+ssl_ignore_hostname = False,                  # ssl, ignore certificate common/alt name name mismatch
 encoding = "windows-1251",                    # email
 helo = "hostname",                            # email
 auth_method = None,                           # email, optional "PLAIN" or "LOGIN"
@@ -27,9 +29,10 @@ password = None,                              # email, optional string
 
 self_test_config = dict \
 (
-server_address = ("mail.domain.com", 25),
-username = "from", # sender's SMTP username (if necessary)
-password = "pass", # sender's SMTP password (if necessary)
+server_address = ("mail.targeted.org", 25),
+helo = "fttx-pool-185.53.43.175.bambit.de",
+username = "test1@targeted.org", # sender's SMTP username (if necessary)
+password = "aaatest1", # sender's SMTP password (if necessary)
 )
 
 # DO NOT TOUCH BELOW THIS LINE
