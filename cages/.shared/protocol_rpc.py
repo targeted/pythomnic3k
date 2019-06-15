@@ -43,6 +43,14 @@
 # There is just one RPC interface and RPC resource required for a cage to be
 # able to exchange RPC calls with other cages.
 #
+# Call arguments are marshaled into binary packets using one of the configured
+# methods. Currently supported are pickle (historically being the only) and
+# msgpack (using its umsgpack.py implementation). Msgpack is the preferred
+# method from security standpoint. Both interface and resource have marshaling_methods
+# in their configuration files. Interface will accept incoming calls marshaled
+# using any of the configured methods, and resource will always marshal outgoing
+# requests using the first supported method.
+#
 # Sample RPC interface configuration (config_interface_rpc.py):
 #
 # config = dict \
@@ -53,6 +61,8 @@
 # max_connections = 100,                                   # tcp
 # broadcast_address = ("1.2.3.4/1.2.3.255", 12480),        # rpc, "interface address/broadcast address", port
 # flock_id = "DEFAULT",                                    # rpc, arbitrary cage group identifier
+# marshaling_methods = ("msgpack", "pickle"),              # rpc, allowed marshaling methods
+# max_packet_size = 1048576,                               # rpc, maximum allowed request/response size in bytes
 # )
 #
 # Sample RPC resource configuration (config_resource_rpc.py)
@@ -64,11 +74,13 @@
 # discovery_timeout = 3.0,                                 # rpc + tcp (discovery + connect timeout)
 # multiple_timeout_allowance = 0.5,                        # rpc, in range 0.0..1.0
 # flock_id = "DEFAULT",                                    # rpc, arbitrary cage group identifier
+# marshaling_methods = ("msgpack", "pickle"),              # rpc, marshaling methods, priority ordered
+# max_packet_size = 1048576,                               # rpc, maximum allowed request/response size in bytes
 # exact_locations = { "SomeCage": "ssl://1.2.3.5:63842" }, # rpc, maps cage names to their fixed locations
 # )
-
+#
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -79,12 +91,13 @@ __all__ = [ "Interface", "Resource", "Handler" ]
 
 import os; from os import urandom, SEEK_SET, SEEK_CUR, SEEK_END, path as os_path
 import time; from time import time
-import binascii; from binascii import b2a_hex
+import binascii; from binascii import a2b_hex, b2a_hex
 import select; from select import select
 import io; from io import BytesIO
 import hashlib; from hashlib import sha1
 import threading; from threading import current_thread, Lock
-import pickle; from pickle import load as unpickle, dumps as pickles
+import pickle; from pickle import load as unpickle, dumps as pickle
+import struct; from struct import pack, unpack
 import random; from random import randint
 import ssl; from ssl import CERT_REQUIRED
 import socket; from socket import socket, AF_INET, SOCK_DGRAM, SOL_SOCKET, \
@@ -95,8 +108,12 @@ except ImportError:
     have_reuse_port = False
 else:
     have_reuse_port = True
-import sys; from sys import version_info
-wrap_socket_has_ciphers = version_info[:2] >= (3, 2)
+try:
+    import umsgpack; from umsgpack import load as unmsgpack, dumps as msgpack
+except ImportError:
+    have_msgpack = False
+else:
+    have_msgpack = True
 
 if __name__ == "__main__": # add pythomnic/lib to sys.path
     import os; import sys
@@ -104,9 +121,8 @@ if __name__ == "__main__": # add pythomnic/lib to sys.path
     sys.path.insert(0, os.path.normpath(os.path.join(main_module_dir, "..", "..", "lib")))
 
 import exc_string; from exc_string import exc_string
-import typecheck; from typecheck import typecheck, optional, by_regex, dict_of
-import pmnc.resource_pool; from pmnc.resource_pool import TransactionalResource, \
-                                                          ResourceError, RPCError
+import typecheck; from typecheck import typecheck, optional, by_regex, dict_of, tuple_of, one_of, anything
+import pmnc.resource_pool; from pmnc.resource_pool import TransactionalResource, ResourceError, RPCError
 import pmnc.timeout; from pmnc.timeout import Timeout
 import pmnc.threads; from pmnc.threads import HeavyThread
 
@@ -117,6 +133,20 @@ valid_node_name = by_regex("^[A-Za-z0-9_-]{1,32}$")
 valid_flock_id = by_regex("^[A-Za-z0-9_-]+$")
 valid_location = by_regex("^(ssl|tcp)://([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|\\*):[0-9]{1,5}/$")
 valid_exact_location = by_regex("^(ssl|tcp)://[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}:[0-9]{1,5}/$")
+valid_marshaling_method = one_of("pickle", "msgpack")
+valid_marshaling_methods = lambda t: tuple_of(valid_marshaling_method)(t) and len(t) > 0
+
+###############################################################################
+
+@typecheck
+def _filter_marshaling_methods(marshaling_methods: optional(valid_marshaling_methods)) -> valid_marshaling_methods:
+    marshaling_methods = marshaling_methods or ("msgpack", "pickle")
+    if "msgpack" in marshaling_methods and not have_msgpack:
+        pmnc.log.warning("marshaling method msgpack requires a missing library u-msgpack-python and is disabled")
+        marshaling_methods = tuple(mm for mm in marshaling_methods if mm != "msgpack")
+        if not marshaling_methods:
+            raise Exception("none of the configured marshaling methods can be used")
+    return marshaling_methods
 
 ###############################################################################
 
@@ -175,59 +205,116 @@ def _locate_key_file(filename: str) -> optional(os_path.isfile):
 
 ###############################################################################
 
-class RpcPacket():
+class RpcMarshaler:
 
-    def __init__(self, max_size: optional(int) = None):
-        self._max_size = max_size
-        self._stream = BytesIO()
-        self._length = None
-        self._expected_hash = None
-        self._hash = None
-        self._method = None
+    def __init__(self, marshaling_methods, max_packet_size):
+        self._marshaling_methods = marshaling_methods
+        self._max_packet_size = max_packet_size
 
-    @staticmethod
-    def marshal(data):
-        return b"PKL3" + pickles(data)
-
-    def _unmarshal(self):
-        if self._method == "PKL3":
-            self._stream.seek(52, SEEK_SET)
-            return unpickle(self._stream)
-        else:
-            raise Exception("unsupported marshaling method: "
-                            "{0:s}".format(self._method))
-
-    def write(self, data: bytes):
-
-        self._stream.write(data)
-        if self._max_size and self._stream.tell() > self._max_size:
+    @typecheck
+    def __call__(self, value: anything, method = None) -> (valid_marshaling_method, bytes):
+        method = method or self._marshaling_methods[0]
+        data_b = getattr(self, "_marshal_{0:s}".format(method))(value)
+        if len(data_b) > self._max_packet_size:
             raise Exception("packet size exceeded")
+        return method, data_b
 
-        if self._length is None and self._stream.tell() >= 8:
-            self._stream.seek(0, SEEK_SET)
-            self._length = int(self._stream.read(8).decode("ascii"), 16) + 48
-            if self._max_size and self._length > self._max_size:
-                raise Exception("request size exceeded")
-            self._stream.seek(0, SEEK_END)
+    # pickle packet is historically marshaled using printable hex
+    # length | hash | pickle data
+    # which is a stupid thing to do
 
-        if self._expected_hash is None and self._stream.tell() >= 48:
-            self._stream.seek(8, SEEK_SET)
-            self._expected_hash = self._stream.read(40).decode("ascii")
-            self._hash = sha1(self._stream.read())
-        elif self._hash is not None:
-            self._hash.update(data)
+    def _marshal_pickle(self, value):
+        content_b = b"PKL3" + pickle(value)
+        return "{0:08X}".format(len(content_b)).encode("ascii") + \
+               sha1(content_b).hexdigest().upper().encode("ascii") + \
+               content_b
 
-        if self._method is None and self._stream.tell() >= 52:
-            self._stream.seek(48, SEEK_SET)
-            self._method = self._stream.read(4).decode("ascii")
-            self._stream.seek(0, SEEK_END)
+    # more logical is to use binary representation of the same
+    # length | hash | msgpack data
 
-        if self._stream.tell() == self._length:
-            if self._hash.hexdigest().upper() != self._expected_hash:
-                raise Exception("request hash mismatch")
-            return self._unmarshal()
-        else:
+    def _marshal_msgpack(self, value):
+        content_b = b"MSGP" + msgpack(value)
+        return pack(">L", len(content_b)) + \
+               sha1(content_b).digest() + \
+               content_b
+
+###############################################################################
+
+class RpcUnmarshaler:
+
+    def __init__(self, marshaling_methods, max_packet_size):
+
+        self._marshaling_methods = marshaling_methods
+        self._max_packet_size = max_packet_size
+
+        self._stream = BytesIO()
+        self._length_size = None
+        self._length = None
+        self._hash_size = None
+        self._hash_b = None
+        self._hash = sha1()
+
+    @typecheck
+    def __call__(self, data_b: bytes) -> optional((valid_marshaling_method, anything)):
+
+        self._stream.write(data_b)
+        stream_length = self._stream.tell()
+
+        if stream_length == 0:
             return None
+        elif stream_length > self._max_packet_size:
+            raise Exception("packet size exceeded")
+        elif self._length is not None and stream_length > self._length:
+            raise Exception("request length exceeded")
+
+        if self._length_size is None:
+            self._stream.seek(0, SEEK_SET) # by reading the first byte
+            b = self._stream.read(1)       # determine whether the packet
+            if ord(b) & 0xf0 == 0:         # has hex or binary header
+                self._length_size = 4
+                self._hash_size = 20
+            else:
+                self._length_size = 8
+                self._hash_size = 40
+            self._stream.seek(0, SEEK_END)
+
+        if stream_length < self._length_size:
+            return None
+        elif self._length is None:
+            self._stream.seek(0, SEEK_SET)
+            length_b = self._stream.read(self._length_size)
+            if self._length_size == 4:
+                self._length = unpack(">L", length_b)[0]
+            else:
+                self._length = int(length_b, 16)
+            self._length += self._length_size + self._hash_size
+            if self._length > self._max_packet_size:
+                raise Exception("packet size exceeded")
+            self._stream.seek(0, SEEK_END)
+
+        if stream_length < self._length_size + self._hash_size:
+            return None
+        elif self._hash_b is None:
+            self._stream.seek(self._length_size, SEEK_SET)
+            if self._hash_size == 20:
+                self._hash_b = self._stream.read(self._hash_size)
+            else:
+                self._hash_b = a2b_hex(self._stream.read(self._hash_size))
+            self._hash.update(self._stream.read())
+        else:
+            self._hash.update(data_b)
+
+        if stream_length == self._length:
+            if self._hash.digest() != self._hash_b:
+                raise Exception("request hash mismatch")
+            self._stream.seek(self._length_size + self._hash_size, SEEK_SET)
+            sig_b = self._stream.read(4)
+            if sig_b == b"MSGP" and "msgpack" in self._marshaling_methods:
+                return "msgpack", unmsgpack(self._stream)
+            elif sig_b == b"PKL3" and "pickle" in self._marshaling_methods:
+                return "pickle", unpickle(self._stream)
+            else:
+                raise Exception("unsupported marshaling method")
 
 ###############################################################################
 
@@ -239,6 +326,8 @@ class Interface: # RPC interface
                  max_connections: int,
                  broadcast_address: (str, int),
                  flock_id: valid_flock_id,
+                 marshaling_methods: optional(valid_marshaling_methods) = None,
+                 max_packet_size: optional(int) = None,
                  separate_thread_pool: optional(bool) = False,
                  disable_broadcast: optional(bool) = False,
                  request_timeout: optional(float) = None,
@@ -250,16 +339,18 @@ class Interface: # RPC interface
         self._disable_broadcast = disable_broadcast
         self._request_prefix = "PYTHOMNIC3K-REQUEST:{0:s}:".format(flock_id)
         self._response_prefix = "PYTHOMNIC3K-RESPONSE:{0:s}:".format(flock_id)
-        self._known_cages = {} # { cage: { node: { location: ..., expires_at: ... } } }
+
+        self._known_cages = {} # { cage: { node: { location: ..., timeout: ... } } }
         self._known_cages_lock = Lock()
         self._ad_period_idx = 0
 
         ssl_key_cert_file = _locate_key_file("key_cert.pem")
         ssl_ca_cert_file = _locate_key_file("ca_cert.pem")
-        ssl_ciphers = wrap_socket_has_ciphers and "HIGH:!aNULL:!MD5" or None
+        ssl_ciphers = "HIGH:!aNULL:!MD5"
+        ssl_protocol = "TLSv1"
 
         if pmnc.request.self_test == __name__: # self-test
-            self.process_rpc_request = kwargs["process_rpc_request"]
+            self.process_request = kwargs["process_request"]
             self._cage_name = kwargs["cage_name"]
             if "ad_periods" in kwargs:
                 self._ad_periods = kwargs["ad_periods"]
@@ -269,8 +360,16 @@ class Interface: # RPC interface
         # having handler factory create handlers through a pmnc call
         # allows online modifications to this module, after it is reloaded
 
+        marshaling_methods = _filter_marshaling_methods(marshaling_methods)
+        if pmnc.log.debug:
+            pmnc.log.debug("interface {0:s} supports the following marshaling methods: {1:s}".\
+                           format(self._name, ", ".join(marshaling_methods)))
+
+        max_packet_size = max_packet_size if max_packet_size is not None else 1048576
+
         handler_factory = lambda prev_handler: \
-            pmnc.protocol_rpc.Handler(self.process_rpc_request, self._cage_name)
+            pmnc.protocol_rpc.Handler(self.process_request, self._cage_name,
+                                      marshaling_methods, max_packet_size)
 
         # create an instance of underlying TCP interface, note that in case
         # of SSL we require the client (source cage) to present a certificate
@@ -285,6 +384,7 @@ class Interface: # RPC interface
                                            ssl_key_cert_file = ssl_key_cert_file,
                                            ssl_ca_cert_file = ssl_ca_cert_file,
                                            ssl_ciphers = ssl_ciphers,
+                                           ssl_protocol = ssl_protocol,
                                            required_auth_level = CERT_REQUIRED)
 
         # RPC interface is special in that it can be configured to enqueue
@@ -338,7 +438,7 @@ class Interface: # RPC interface
                                 try:
                                     packet, (client_addr, client_port) = self._bc_socket.recvfrom(57344)
                                 except socket_error as e:
-                                    if e.args[0] == 10054: # workaround for this issue: http://support.microsoft.com/kb/263823
+                                    if e.args[0] == 10054: # workaround for http://support.microsoft.com/kb/263823
                                         continue
                                     else:
                                         raise
@@ -491,23 +591,22 @@ class Interface: # RPC interface
                         if pmnc.log.debug:
                             pmnc.log.debug("received cage advertisement: {0:s}.{1:s} "
                                            "is at {2:s}".format(node, cage, location))
-                    nodes[node] = dict(location = location, expires_at = time() + period * 2)
+                    nodes[node] = dict(location = location, timeout = Timeout(period * 2.0))
 
     ###################################
 
     def _purge_known_cages(self):
 
-        purge_time = time()
         with self._known_cages_lock:
             for cage, nodes in self._known_cages.items():
                 expired_nodes = [ node for node, cage_info in nodes.items()
-                                  if cage_info["expires_at"]  < purge_time ]
+                                  if cage_info["timeout"].expired ]
                 for expired_node in expired_nodes:
                     del nodes[expired_node]
 
     ###################################
 
-    def process_rpc_request(self, module, method, args, kwargs):
+    def process_request(self, module, method, args, kwargs):
         return pmnc.__getattr__(module).__getattr__(method)(*args, **kwargs)
 
 ###############################################################################
@@ -516,25 +615,28 @@ class Handler: # this class is instantiated from interface_tcp
 
     protocol = "rpc"
 
-    _max_request_size = 1048576
-
     idle_timeout = 86400.0 # server side of an RPC connection will be kept until
                            # the client closes it, either as idle or expired
 
     ###################################
 
-    def __init__(self, process_rpc_request, cage_name):
-        self._process_rpc_request = process_rpc_request
+    def __init__(self, process_request, cage_name, marshaling_methods, max_packet_size):
+        self._process_request = process_request
         self._cage_name = cage_name
-        self._rpc_packet = RpcPacket(self._max_request_size)
+        self._marshaling_methods = marshaling_methods
+        self._max_packet_size = max_packet_size
+        self._unmarshaler = RpcUnmarshaler(marshaling_methods, max_packet_size)
+        self._local_ts = None
 
     ###################################
 
     @typecheck
-    def consume(self, data: bytes) -> bool:
-        rpc_request = self._rpc_packet.write(data)
-        if rpc_request is not None:
-            self._rpc_request = rpc_request # the packet has been received and parsed
+    def consume(self, data_b: bytes) -> bool:
+        if self._local_ts is None:
+            self._local_ts = time()
+        method_request = self._unmarshaler(data_b)
+        if method_request is not None:
+            self._method, self._request = method_request # the packet has been received in full and parsed
             return True
         else:
             return False
@@ -546,34 +648,23 @@ class Handler: # this class is instantiated from interface_tcp
 
     def process_tcp_request(self):
 
-        rpc_request = self._rpc_request
-
         # extract call information from the dict contained
         # in the received request
 
-        assert rpc_request["target_cage"] == self._cage_name, \
-               "expected call to this cage"
+        request = self._request
+        source_node = request.get("source_node") # backwards compatibility 1.5+
+        target_cage = request["target_cage"]
+        source_cage = request["source_cage"]
+        module = request["module"]
+        method = request["method"]
+        args = request["args"]
+        kwargs = request["kwargs"]
+        request_dict = request["request"]
+        rpc_dict = request.get("rpc") # backwards compatibility 1.5+
 
-        source_cage = rpc_request["source_cage"]
-        module = rpc_request["module"]
-        method = rpc_request["method"]
-        module_method = "{0:s}.{1:s}".format(module, method)
-        args = rpc_request["args"]
-        kwargs = rpc_request["kwargs"]
+        assert target_cage == self._cage_name, "expected call to this cage"
 
-        # extract the original request, note that its remaining time
-        # is decreased if the current RPC request has less time left
-
-        request_dict = rpc_request["request"]
-
-        request_dict.setdefault("interface", "rpc") # backwards compatibility section
-        request_dict.setdefault("protocol", "rpc")
-        request_dict["parameters"].setdefault("auth_tokens", {}).\
-                                   setdefault("source_cage", source_cage)
-
-        request = pmnc.request.from_dict(request_dict, timeout = pmnc.request.remain)
-
-        # if the connection arrived over SSL, we verify source
+        # if the connection arrived over SSL, verify source
         # cage name against the peer's SSL certificate
 
         auth_tokens = pmnc.request.parameters["auth_tokens"]
@@ -582,8 +673,29 @@ class Handler: # this class is instantiated from interface_tcp
            not by_regex("^{0:s}$".format(auth_tokens["peer_cn"]))(source_cage):
             raise Exception("source cage name does not match its SSL certificate")
 
+        if rpc_dict: # hop-by-hop information is processed
+
+            if __node__ != source_node: # correct request deadline by the hosts time difference
+                request_dict["deadline"] += self._local_ts - rpc_dict["ts"]
+
+        # extract the original request parameters, note that its remaining time
+        # is decreased if the current RPC request has less time left
+
+        request_dict.setdefault("interface", "rpc") # backwards compatibility section
+        request_dict.setdefault("protocol", "rpc")
+        request_dict["parameters"].setdefault("auth_tokens", {}).\
+                                   setdefault("source_cage", source_cage)
+
+        # request deadline calculation, this cage imposes its own restriction
+        # with local request_timeout, the received request has its own deadline,
+        # and time on this host and  on source host could be different
+
+        request = pmnc.request.from_dict(request_dict, timeout = pmnc.request.remain)
+
         # now we know more about the request, it is still the current
         # RPC request, we haven't impersonated the received request yet
+
+        module_method = "{0:s}.{1:s}".format(module, method)
 
         pmnc.request.describe("RPC call {0:s} from {1:s} at {2:s}".\
                               format(module_method, source_cage, auth_tokens["peer_ip"]))
@@ -593,43 +705,42 @@ class Handler: # this class is instantiated from interface_tcp
             original_request = current_thread()._request
             current_thread()._request = request
             try:
-                result = self._process_rpc_request(module, method, args, kwargs)
+                result = self._process_request(module, method, args, kwargs)
             finally:
                 current_thread()._request = original_request
         except:
             error = exc_string()
             pmnc.log.error("incoming RPC call failed: {0:s}".format(error))
-            rpc_response = dict(exception = error)
-            deliver_message = "RPC error"
+            response = dict(exception = error)
+            response_description = "RPC error"
         else:
-            rpc_response = dict(result = result)
-            deliver_message = "RPC response, {0:d} byte(s)"
+            response = dict(result = result)
+            response_description = "RPC response"
 
         # marshal the response and prepare for delivery, note that
         # the delivery is done on behalf and within the local request
 
-        response_bytes = RpcPacket.marshal(rpc_response)
-        response_hash = sha1(response_bytes).hexdigest().upper()
-        response_packet = "{0:08X}{1:s}".\
-                          format(len(response_bytes), response_hash).\
-                          encode("ascii") + response_bytes
-        self._response = BytesIO(response_packet)
+        marshaler = RpcMarshaler(self._marshaling_methods, self._max_packet_size)
+        response_method, response_b = marshaler(response, self._method) # note that the response is marshaled
+        assert response_method == self._method                          # using the same method as the request
+
+        self._response_stream = BytesIO(response_b)
 
         if pmnc.log.debug:
-            pmnc.log.debug("returning {0:s}".format(
-                           deliver_message.format(len(response_packet))))
+            pmnc.log.debug("returning {0:s}, {1:d} {2:s} byte(s)".\
+                           format(response_description, len(response_b), self._method))
 
     ###################################
 
     @typecheck
     def produce(self, n: int) -> bytes:
-        return self._response.read(n)
+        return self._response_stream.read(n)
 
     ###################################
 
     @typecheck
     def retract(self, n: int):
-        self._response.seek(-n, SEEK_CUR)
+        self._response_stream.seek(-n, SEEK_CUR)
 
 ###############################################################################
 
@@ -641,6 +752,8 @@ class Resource(TransactionalResource): # RPC resource
                  discovery_timeout: float,
                  multiple_timeout_allowance: float,
                  flock_id: valid_flock_id,
+                 marshaling_methods: optional(valid_marshaling_methods) = None,
+                 max_packet_size: optional(int) = None,
                  exact_locations: dict_of(valid_cage_name, valid_exact_location),
                  pool__resource_name: valid_cage_name):
 
@@ -656,6 +769,13 @@ class Resource(TransactionalResource): # RPC resource
             self._multiple_timeout_allowance = min(multiple_timeout_allowance, 1.0)
             self._request_prefix = "PYTHOMNIC3K-REQUEST:{0:s}:".format(flock_id)
             self._response_prefix = "PYTHOMNIC3K-RESPONSE:{0:s}:".format(flock_id)
+
+        self._marshaling_methods = _filter_marshaling_methods(marshaling_methods)
+        if pmnc.log.debug:
+            pmnc.log.debug("resource {0:s} is using marshaling method {1:s}".\
+                           format(name, marshaling_methods[0]))
+
+        self._max_packet_size = max_packet_size if max_packet_size is not None else 1048576
 
     ###################################
 
@@ -712,26 +832,27 @@ class Resource(TransactionalResource): # RPC resource
 
             # wrap all the call parameters in a plain dict
 
-            request = dict(source_cage = __cage__,
+            request = dict(source_node = __node__,
+                           source_cage = __cage__,
                            target_cage = self._cage_name,
                            module = module, method = method,
                            args = args, kwargs = kwargs,
                            request = request_dict)
 
+            # hop-by-hop information is inserted
+
+            request["rpc"] = dict(ts = time()) # time on sending host
+
             # marshal the call into a packet of bytes
 
-            request_bytes = RpcPacket.marshal(request)
-            request_hash = sha1(request_bytes).hexdigest().upper()
-            request_packet = "{0:08X}{1:s}".\
-                             format(len(request_bytes), request_hash).\
-                             encode("ascii") + request_bytes
+            marshaler = RpcMarshaler(self._marshaling_methods, self._max_packet_size)
+            request_method, request_b = marshaler(request)
 
-            self._response = RpcPacket()
+            self._unmarshaler = RpcUnmarshaler(self._marshaling_methods, self._max_packet_size)
 
             request_description = \
-                "RPC request {0:s}.{1:s} to {2:s}, {3:d} byte(s)".\
-                format(module, method, self._tcp_resource.server_info,
-                       len(request_packet))
+                "RPC request {0:s}.{1:s} to {2:s}, {3:d} {4:s} byte(s)".\
+                format(module, method, self._tcp_resource.server_info, len(request_b), request_method)
 
             service_request = module == "remote_call" and method == "accept"
 
@@ -741,11 +862,13 @@ class Resource(TransactionalResource): # RPC resource
         if not service_request: pmnc.log.info("sending {0:s}".format(request_description))
         try:
 
-            response = self._tcp_resource.send_request(request_packet, self.response_handler)
+            response_method, response = self._tcp_resource.send_request(request_b, self._unmarshaler)
             try:
                 result = response["result"]
             except KeyError:
                 raise RPCError(description = response["exception"], terminal = False)
+            else:
+                assert response_method == request_method
 
         except RPCError as e:
             pmnc.log.warning("{0:s} returned error: {1:s}".\
@@ -758,11 +881,6 @@ class Resource(TransactionalResource): # RPC resource
         else:
             if not service_request: pmnc.log.info("RPC request returned successfully")
             return result
-
-    ###################################
-
-    def response_handler(self, data: bytes) -> optional(dict):
-        return self._response.write(data)
 
     ###################################
 
@@ -801,18 +919,23 @@ class Resource(TransactionalResource): # RPC resource
         if discovered_location.startswith("ssl://"):
             ssl_key_cert_file = _locate_key_file("key_cert.pem")
             ssl_ca_cert_file = _locate_key_file("ca_cert.pem")
-            ssl_ciphers = wrap_socket_has_ciphers and "HIGH:!aNULL:!MD5" or None
+            ssl_ciphers = "HIGH:!aNULL:!MD5"
+            ssl_protocol = "TLSv1"
         elif discovered_location.startswith("tcp://"):
             ssl_key_cert_file = None
             ssl_ca_cert_file = None
             ssl_ciphers = None
+            ssl_protocol = None
 
         return pmnc.protocol_tcp.TcpResource(self._cage_name,
                                              server_address = (cage_addr, int(cage_port)),
                                              connect_timeout = timeout.remain,
                                              ssl_key_cert_file = ssl_key_cert_file,
                                              ssl_ca_cert_file = ssl_ca_cert_file,
-                                             ssl_ciphers = ssl_ciphers)
+                                             ssl_ciphers = ssl_ciphers,
+                                             ssl_protocol = ssl_protocol,
+                                             ssl_server_hostname = None,
+                                             ssl_ignore_hostname = True)
 
     ###################################
 
@@ -921,10 +1044,128 @@ class Resource(TransactionalResource): # RPC resource
 
 def self_test():
 
-    from pmnc.request import fake_request
+    if not have_msgpack:
+        raise Exception("umsgpack.py is required to test this module")
+
     from time import sleep
+    from expected import expected
+    from pmnc.request import fake_request
     from pmnc.self_test import active_interface
     from pmnc.resource_pool import TransactionExecutionError
+    from umsgpack import InsufficientDataException
+    from pmnc.timeout import Timeout
+
+    ###################################
+
+    def test_marshaling_methods():
+
+        global have_msgpack
+
+        assert _filter_marshaling_methods(None) == ("msgpack", "pickle")
+        assert _filter_marshaling_methods(("pickle", )) == ("pickle", )
+        assert _filter_marshaling_methods(("msgpack", )) == ("msgpack", )
+        assert _filter_marshaling_methods(("pickle", "msgpack")) == ("pickle", "msgpack")
+
+        have_msgpack = False
+        assert _filter_marshaling_methods(None) == ("pickle", )
+        assert _filter_marshaling_methods(("pickle", )) == ("pickle", )
+        with expected(Exception("none of the configured marshaling methods can be used")):
+            _filter_marshaling_methods(("msgpack", ))
+        assert _filter_marshaling_methods(("pickle", "msgpack")) == ("pickle", )
+
+        have_msgpack = True
+
+    test_marshaling_methods()
+
+    ###################################
+
+    def test_marshaling():
+
+        with expected(Exception("packet size exceeded")):
+            RpcMarshaler(("pickle", "msgpack"), 1)("foo")
+
+        m = RpcMarshaler(("pickle", "msgpack"), 1024)
+        t, p = m("foo")
+
+        assert t == "pickle"
+        assert p == b"00000011788B085646895FE0185AAD076A9FD05F9D436EE2PKL3\x80\x03X\x03\x00\x00\x00fooq\x00."
+        assert len(b"PKL3\x80\x03X\x03\x00\x00\x00fooq\x00.") == 0x00000011
+        assert sha1(b"PKL3\x80\x03X\x03\x00\x00\x00fooq\x00.").hexdigest().upper() == "788B085646895FE0185AAD076A9FD05F9D436EE2"
+
+        with expected(Exception("packet size exceeded")):
+            RpcUnmarshaler(("msgpack", "pickle"), 1)(p)
+
+        def unmarshal(p):
+            um = RpcUnmarshaler(("msgpack", "pickle"), 1024)
+            while p:
+                i = randint(1, 10)
+                pp, p = p[:i], p[i:]
+                r = um(pp)
+                assert (p and not r) or (not p and r)
+            return r
+
+        assert RpcUnmarshaler(("msgpack", "pickle"), 1024)(p) == ("pickle", "foo")
+
+        t = Timeout(10.0)
+        while not t.expired:
+            assert unmarshal(p) == ("pickle", "foo")
+
+        with expected(Exception("unsupported marshaling method")):
+            RpcUnmarshaler(("msgpack", ), 1024)(p)
+
+        with expected(Exception("request hash mismatch")):
+            RpcUnmarshaler(("pickle", ), 1024)(p[:8] + b"0" + p[9:])
+
+        um = RpcUnmarshaler(("pickle", ), 1024)
+        um(b"00000010")
+        with expected(Exception("request length exceeded")):
+            um(p[8:])
+
+        um = RpcUnmarshaler(("pickle", ), 1024)
+        um(b"00000010389C94157D9C6C6B3F9231E3F4E2EFD3FF1271A4")
+        with expected(EOFError):
+            um(p[48:-1])
+
+        ###
+
+        with expected(Exception("packet size exceeded")):
+            RpcMarshaler(("msgpack", "pickle"), 1)("foo")
+
+        m = RpcMarshaler(("msgpack", "pickle"), 1024)
+        t, p = m("foo")
+
+        assert t == "msgpack"
+        assert p == b"\x00\x00\x00\x08\x06\x9d\x93\x14'\xdc\xfbCO\x9f5[\x8eS+\x9b$~\xc5,MSGP\xa3foo"
+        assert len(b"MSGP\xa3foo") == 0x00000008
+        assert sha1(b"MSGP\xa3foo").digest() == b"\x06\x9d\x93\x14'\xdc\xfbCO\x9f5[\x8eS+\x9b$~\xc5,"
+
+        with expected(Exception("packet size exceeded")):
+            RpcUnmarshaler(("msgpack", "pickle"), 1)(p)
+
+        assert RpcUnmarshaler(("msgpack", "pickle"), 1024)(p) == ("msgpack", "foo")
+
+        t = Timeout(10.0)
+        while not t.expired:
+            assert unmarshal(p) == ("msgpack", "foo")
+
+        with expected(Exception("unsupported marshaling method")):
+            RpcUnmarshaler(("pickle", ), 1024)(p)
+
+        with expected(Exception("request hash mismatch")):
+            RpcUnmarshaler(("msgpack", ), 1024)(p[:4] + b"\x00" + p[5:])
+
+        um = RpcUnmarshaler(("msgpack", ), 1024)
+        um(b"\x00\x00\x00\x07")
+        with expected(Exception("request length exceeded")):
+            um(p[4:])
+
+        um = RpcUnmarshaler(("msgpack", ), 1024)
+        um(b"\x00\x00\x00\x07")
+        um(b"\x041\xb0\x02U\xa4C\x93\xb9<^\x06\xe0\xaa\x94\xa4y\xfd\xa8\xd7")
+        with expected(InsufficientDataException):
+            um(p[24:-1])
+
+    test_marshaling()
 
     ###################################
 
@@ -935,6 +1176,8 @@ def self_test():
     max_connections = 100,
     broadcast_address = ("0.0.0.0/255.255.255.255", 12481),
     flock_id = "SELF_TEST",
+    marshaling_methods = ("pickle", "msgpack"),
+    max_packet_size = 1048576,
     )
 
     def interface_config(**kwargs):
@@ -972,10 +1215,10 @@ def self_test():
 
     def test_start_stop_interface():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             pass
 
-        with active_interface("rpc", cage_name = "cage_start_stop", **interface_config(process_rpc_request = process_rpc_request)) as ifc:
+        with active_interface("rpc", cage_name = "cage_start_stop", **interface_config(process_request = process_request)) as ifc:
             assert ifc.listener_address[0] == bind_address
             assert 63000 <= ifc.listener_address[1] < 64000
             assert ifc._broadcast_port == 12481
@@ -1004,10 +1247,10 @@ def self_test():
 
     def test_discover_once():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             pass
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_discover_once")) as ifc:
 
             s = _create_sending_broadcast_socket(bind_address)
@@ -1036,10 +1279,10 @@ def self_test():
 
     def test_advertisement():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             pass
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_advertisement", ad_periods = (1.0, ))) as ifc:
 
             assert not ifc.get_cages()
@@ -1069,10 +1312,10 @@ def self_test():
 
     def test_exact_location():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             return "been there"
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_exact_location", ad_periods = (1.0, ))) as ifc:
 
             fake_request(10.0)
@@ -1094,6 +1337,8 @@ def self_test():
                                                   discovery_timeout = 3.0,
                                                   multiple_timeout_allowance = 0.0,
                                                   flock_id = "UNUSED",
+                                                  marshaling_methods = ("msgpack", "pickle"),
+                                                  max_packet_size = 1048576,
                                                   exact_locations = exact_locations, # same as in config file
                                                   pool__resource_name = "cage_exact_location")
             resource.connect()
@@ -1119,10 +1364,10 @@ def self_test():
 
     def test_resource_success():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             return eval(args[0])
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_resource_success")) as ifc:
 
             fake_request(10.0)
@@ -1133,7 +1378,11 @@ def self_test():
             xa.rpc__cage_resource_success.biz.baz("pmnc.request.to_dict()")
             r1, r2 = xa.execute()
 
-            assert r1 == ("foo", "bar", ("module, method, args, kwargs", "param"), { "a": "b" })
+            assert r1 in \
+                (
+                    ("foo", "bar", ("module, method, args, kwargs", "param"), { "a": "b" }),
+                    ["foo", "bar", ["module, method, args, kwargs", "param"], { "a": "b" }],
+                )
 
             deadline = r2.pop("deadline")
             assert abs(deadline - (time() + pmnc.request.remain)) < 0.01
@@ -1154,10 +1403,10 @@ def self_test():
 
     def test_resource_failure():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             1 / 0
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_resource_failure")) as ifc:
 
             fake_request(10.0)
@@ -1175,11 +1424,11 @@ def self_test():
 
     def test_resource_local_timeout():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             assert 1.5 < pmnc.request.remain < 2.5 # interface timeout takes over the received request timeout
             sleep(3.0)
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_resource_local_timeout", request_timeout = 2.0)) as ifc:
 
             fake_request(5.0)
@@ -1197,11 +1446,11 @@ def self_test():
 
     def test_resource_remote_timeout():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             assert 2.5 < pmnc.request.remain < 3.5 # inherited remote timeout
             sleep(4.0)
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_resource_remote_timeout")) as ifc:
 
             fake_request(5.0)
@@ -1237,17 +1486,17 @@ def self_test():
 
     def test_pmnc_success():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             return module, method, args, kwargs, pmnc.request.to_dict()
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_pmnc_success")) as ifc:
             fake_request(5.0)
             pmnc.request.describe("yes it is")
             result = pmnc("cage_pmnc_success").foo.bar(1, "foo", biz = "baz")
 
         module, method, args, kwargs, request = result
-        assert module == "foo" and method == "bar" and args == (1, "foo") and kwargs == { "biz": "baz" }
+        assert module == "foo" and method == "bar" and args in ( (1, "foo"), [1, "foo"] ) and kwargs == { "biz": "baz" }
 
         deadline = request.pop("deadline")
         assert abs(deadline - (time() + pmnc.request.remain)) < 0.01
@@ -1268,16 +1517,16 @@ def self_test():
 
     def test_pmnc_failure():
 
-        def process_rpc_request(module, method, args, kwargs):
+        def process_request(module, method, args, kwargs):
             {}["not-there"]
 
-        with active_interface("rpc", **interface_config(process_rpc_request = process_rpc_request,
+        with active_interface("rpc", **interface_config(process_request = process_request,
                               cage_name = "cage_pmnc_failure")) as ifc:
             fake_request(5.0)
             try:
                 pmnc("cage_pmnc_failure").foo.bar()
             except RPCError as e:
-                assert e.description.startswith("KeyError(\"'not-there'\") in process_rpc_request()")
+                assert e.description.startswith("KeyError(\"'not-there'\") in process_request()")
                 assert not e.recoverable and not e.terminal
             else:
                 assert False
@@ -1288,17 +1537,17 @@ def self_test():
 
     def test_two_calls():
 
-        def process_rpc_request1(module, method, args, kwargs):
+        def process_request1(module, method, args, kwargs):
             assert pmnc.request.parameters["auth_tokens"]["source_cage"] == __cage__
             pmnc.request.parameters["auth_tokens"]["source_cage"] = "set once"
             return pmnc("cage_second").module.second()
 
-        def process_rpc_request2(module, method, args, kwargs):
+        def process_request2(module, method, args, kwargs):
             return pmnc.request.to_dict()
 
-        with active_interface("rpc1", **interface_config(process_rpc_request = process_rpc_request1,
+        with active_interface("rpc1", **interface_config(process_request = process_request1,
                               cage_name = "cage_first")) as ifc1:
-            with active_interface("rpc2", **interface_config(process_rpc_request = process_rpc_request2,
+            with active_interface("rpc2", **interface_config(process_request = process_request2,
                                   cage_name = "cage_second")) as ifc2:
                 fake_request(10.0)
                 result = pmnc("cage_first").foo.bar()

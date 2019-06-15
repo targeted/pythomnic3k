@@ -124,39 +124,41 @@
 # all of the resources are waited to commit, and should any of them become slow
 # it defeats the entire purpose of the "fastest" result.
 #
-# Caching (see resource_pool.py for more information):
+# Caching (see resource_pool_cache.py for more information):
 #
-# You can control the cache behaviour by supplying the following kwargs
-# to the resource call:
-#
-# >> xa.resource.foo(1, biz = "baz", pool__cache_ttl = M.M)
-# The result of this particular call is cached for M.M seconds, None = forever.
+# You can control the cache behaviour by supplying the following optional
+# kwargs to the resource call:
 #
 # >> xa.resource.foo(1, biz = "baz", pool__cache_key = "key")
 # The result of this particular call is cached under this literal key,
 # thus changing the above "identical" semantics. As an alternative,
 # a function could be passed for pool__cache_key, which then in turn
-# returns the actual key value.
+# returns the actual key value. The default caching key is essentially
+# all arguments to the resource call i.e. (attrs, args, kwargs)
 #
-# >> xa.resource.foo(1, biz = "baz", pool__cache_lookup = lambda: cache, key: ...)
-# Callable to override cache lookup behaviour altogether.
-# The default behaviour is something like cache.get(key)
-#
-# >> xa.resource.foo(1, biz = "baz", pool__cache_update = lambda: cache, key, value: ...)
-# Callable to override cache update behaviour altogether.
-# The default behaviour is something like cache.put(key, value)
-#
-# A transaction marks every entry it caches with float weight equal to the number
-# of seconds the resource has been executing. This makes cache eviction policy
+# >> xa.resource.foo(1, biz = "baz", pool__cache_weight = N.N)
+# Float weight of the resulting cache entry. By default a transaction assigns
+# every entry it caches with float weight equal to the number of seconds
+# the resource has been executing. This makes cache eviction policy
 # "weight" particularly useful, as the cheapest entries get evicted first.
 #
+# >> xa.resource.foo(1, biz = "baz", pool__cache_wrap = lambda value: ...)
+# Callable to be executed on the actual execution result before it's cached.
+# The wrapped value will later be returned from the cache.
+#
+# >> xa.resource.foo(1, biz = "baz", pool__cache_get = lambda key: ...)
+# Callable to override cache get behaviour altogether.
+#
+# >> xa.resource.foo(1, biz = "baz", pool__cache_put = lambda key, value: ...)
+# Callable to override cache put behaviour altogether.
+#
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
 
-__all__ = [ "create", "Transaction", "__getattr__" ]
+__all__ = [ "create", "Transaction", "__get_module_attr__" ]
 
 ################################################################################
 
@@ -164,6 +166,7 @@ import os; from os import urandom
 import binascii; from binascii import b2a_hex
 import threading; from threading import Event
 import time; from time import time, strftime
+import inspect; from inspect import isfunction
 
 if __name__ == "__main__": # add pythomnic/lib to sys.path
     import os; import sys
@@ -173,8 +176,10 @@ if __name__ == "__main__": # add pythomnic/lib to sys.path
 import exc_string; from exc_string import exc_string
 import typecheck; from typecheck import typecheck, callable, optional
 import interlocked_queue; from interlocked_queue import InterlockedQueue
+import interlocked_counter; from interlocked_counter import InterlockedCounter
 import pmnc.thread_pool; from pmnc.thread_pool import WorkUnitTimedOut
 import pmnc.samplers; from pmnc.samplers import RateSampler
+import pmnc.timeout; from pmnc.timeout import Timeout
 import pmnc.resource_pool; from pmnc.resource_pool import ResourceError, \
                                 TransactionCommitError, TransactionExecutionError
 
@@ -192,6 +197,7 @@ def create(*, __source_module_name, **options):
 class Transaction:
 
     _transaction_rate_sampler = RateSampler(10.0)
+    _transaction_count = InterlockedCounter()
 
     @typecheck
     def __init__(self, source_module_name, *,
@@ -269,9 +275,8 @@ class Transaction:
             resource_in_transaction = False # no transaction has been started on the instance
             resource_failed = True          # (preventive) request execution has been a failure
             cache_key = None                # cache key to refer to this transaction's result
-            cached_result = None            # result being delivered from the cache
-            result_to_cache = None          # a new result to be put in the cache
-            result_to_cache_weight = None   # processing time assigned as weight to the cached entry
+            cached_result = None            # value returned from the cache
+            result = None                   # the actual execution result
 
             while True: # breaks when the result is obtained, either value or exception
 
@@ -298,68 +303,9 @@ class Transaction:
                                     recoverable = True, terminal = True) # but not really terminal,
                     break # while True                                   # no instance to terminate
 
-                # some resource instance has been allocated, beginning a transaction,
-                # a failure would result in a ResourceError, recoverable yet terminal
-                # unless explicitly specified otherwise
+                # some resource instance has been allocated
 
                 try:
-
-                    # see if the resource pool's cache contains a result already
-
-                    try:
-                        cache_key = resource_instance.cache_key(resource_pool.cache, # note that cache can be None
-                                                                attrs, args, kwargs) # note that kwargs is passed by reference and can be modified
-                        if cache_key is not None:                                    # for instance by removing entries controlling cache behaviour
-                            cached_result = result = resource_instance.cache_lookup(resource_pool.cache, cache_key)
-                    except:
-                        pmnc.log.warning(exc_string()) # log and proceed without cache
-                    else:
-                        if cached_result is not None:
-                            resource_failed = False
-                            break # while True
-
-                    # see if a transaction should be started in as much time as the request has left
-
-                    if pmnc.request.remain < resource_instance.min_time:
-                        raise ResourceError(description = "transaction {0:s} is declined by resource instance " # tested
-                                                          "{1:s}".format(self, resource_instance.name),
-                                            recoverable = True, terminal = False) # the instance stays alive
-
-                    if pmnc.log.noise:
-                        pmnc.log.noise("resource instance {0:s} is used in transaction {1:s}, {2:s}".\
-                                       format(resource_instance.name, self, self._resource_ttl(resource_instance)))
-
-                    # begin a new transaction, this is presumably reversible operation
-
-                    resource_instance.begin_transaction(self._xid,
-                                                        source_module_name = self._source_module_name,
-                                                        transaction_options = self._options,
-                                                        resource_args = res_args,
-                                                        resource_kwargs = res_kwargs)
-
-                except ResourceError as e:
-                    result = self._apply_error(participant_index, resource_instance, e)
-                    break # while True
-                except: # tested
-                    result = ResourceError.snap_exception(
-                                    participant_index = participant_index,
-                                    recoverable = True, terminal = True)
-                    resource_instance.expire()
-                    break # while True
-                else:
-                    resource_in_transaction = True
-
-                # resource instance is now in transaction, executing the request,
-                # a failure would result in a ResourceError, unrecoverable and
-                # terminal unless explicitly specified otherwise
-
-                try:
-
-                    # replay attribute accesses to obtain the actual target method
-
-                    target_method = resource_instance
-                    for attr in attrs:
-                        target_method = getattr(target_method, attr)
 
                     # see if request deadline should be restricted for the course of transaction
 
@@ -371,21 +317,136 @@ class Transaction:
                             if pmnc.log.noise:
                                 pmnc.log.noise("request deadline is restricted for the course of transaction")
                         else:
-                            max_time = None
-                    try:
+                            max_time = None # to not restore timeout to a bigger value than it already has now
 
-                        # execute the request, registering the execution time
+                    try: # finally restore the timeout
 
-                        processing_start = time()
+                        # see if there is a cached result
+
+                        cache_kwargs = { k: v for k, v in kwargs.items() if k.startswith("pool__cache_") }
+                        for k in cache_kwargs:
+                            del kwargs[k]
+
+                        # cache key may be passed in pool__cache_key as a literal value
+                        # or as a callable taking (attrs, args, kwargs) as parameters,
+                        # and if it is not specified, the default cache key is simply
+                        # a tuple of frozen (attrs, args, kwargs)
+
+                        if not resource_pool.has_cache:
+                            cache_key = None
+                        elif "pool__cache_key" in cache_kwargs:
+                            cache_key = cache_kwargs.pop("pool__cache_key") # but this still can be None
+                        else:
+                            cache_key = lambda attrs, args, kwargs: (tuple(attrs), args, frozenset(kwargs.items()))
+
+                        if isfunction(cache_key):
+                            cache_key = cache_key(attrs, args, kwargs)
+
+                        # if cache key evaluated to None after all, the cache is bypassed at all
+
+                        if cache_key is not None:
+                            cache_get = cache_kwargs.pop("pool__cache_get", None) or resource_pool.cache_get
+                            cache_put = cache_kwargs.pop("pool__cache_put", None) or resource_pool.cache_put
+
+                        # weight can be overridden by the caller
+
+                        cache_weight = cache_kwargs.pop("pool__cache_weight", None)
+
+                        # executable to wrap the result before it's cached
+
+                        cache_wrap = cache_kwargs.pop("pool__cache_wrap", None)
+
+                        # this id allows the cache to match get/put calls from the same transaction
+
+                        transaction_id = self._transaction_count.next()
+
+                        # getting result from the cache may not be instant, therefore
+                        # the timeout is passed, moreover it could block for a while
+                        # and still return None
+
+                        try:
+                            if cache_key is not None:
+                                cached_result = cache_get(cache_key,
+                                                          pool__cache_timeout = pmnc.request.remain,
+                                                          pool__cache_transaction_id = transaction_id,
+                                                          **cache_kwargs)
+                        except:
+                            pmnc.log.error("cache get failed in {0:s}: {1:s}".format(self, exc_string())) # log and proceed without cache
+                            cache_failed = True
+                        else:
+                            cache_failed = False
+
                         try:
 
-                            with pmnc.performance.timing("resource.{0:s}.processing_time".format(resource_name)):
-                                result_to_cache = result = target_method(*args, **kwargs)
+                            if cached_result is None: # not found in the cache, but this transaction is allowed to proceed
+
+                                # see if the transaction should be started in as little time as the request has left
+
+                                if pmnc.request.remain < resource_instance.min_time:
+                                    raise ResourceError(description = "transaction {0:s} is declined by resource instance "
+                                                                      "{1:s}".format(self, resource_instance.name),
+                                                        recoverable = True, terminal = False)
+
+                                if pmnc.log.noise:
+                                    pmnc.log.noise("resource instance {0:s} is used in transaction {1:s}, {2:s}".\
+                                                   format(resource_instance.name, self, self._resource_ttl(resource_instance)))
+
+                                # begin a new transaction, this is presumably a reversible operation
+
+                                resource_instance.begin_transaction(self._xid,
+                                                                    source_module_name = self._source_module_name,
+                                                                    transaction_options = self._options,
+                                                                    resource_args = res_args,
+                                                                    resource_kwargs = res_kwargs)
+
+                                resource_in_transaction = True
+
+                                # replay attribute accesses to obtain the actual target method
+
+                                target_method = resource_instance
+                                for attr in attrs:
+                                    target_method = getattr(target_method, attr)
+
+                                # execute the request, registering the execution time
+
+                                processing_start = time()
+                                try:
+                                    with pmnc.performance.timing("resource.{0:s}.processing_time".format(resource_name)):
+                                        result = target_method(*args, **kwargs)
+                                finally:
+                                    if cache_weight is None:                               # by default cache weight
+                                        cache_weight = max(time() - processing_start, 0.0) # is the execution time
+
+                                # technically the resource call may return None, but then it wouldn't be cached
+
+                                if result is not None and cache_wrap: # note that wrapping takes place even when
+                                    try:                              # cache_key is None or cache_failed because
+                                        result = cache_wrap(result)   # the caller expects a uniform result format
+                                    except:
+                                        result = None # this invalidates the execution result because
+                                        raise         # now it can neither be cached nor returned
+
+                            elif cached_result is Timeout: # not found in the cache and timeout has expired, technically this is
+                                                           # the same as pmnc.request.expired but comparing time could be unreliable
+
+                                raise ResourceError(description = "request deadline waiting for cached result from resource {0:s} "
+                                                                  "in transaction {1:s}".format(resource_instance.name, self),
+                                                    recoverable = True, terminal = False)
 
                         finally:
-                            result_to_cache_weight = max(time() - processing_start, 0.0)
+                            if cache_key is not None and not cache_failed:
+                                try:
+                                    cache_put(cache_key, result, # contains actual execution result or None upon exception
+                                              pool__cache_weight = cache_weight, # contains actual execution time or None
+                                              pool__cache_transaction_id = transaction_id,
+                                              **cache_kwargs)
+                                except:
+                                    pmnc.log.error("cache put failed in {0:s}: {1:s}".format(self, exc_string())) # log and ignore cache error only
 
-                    finally:
+                        if cached_result is not None and cached_result is not Timeout: # now the cached result is put into place
+                            result = cached_result
+
+                    finally: # restore the request timeout if it has been restricted
                         if max_time is not None:
                             pmnc.request.remain = request_start + request_remain - time()
                             if pmnc.log.noise:
@@ -397,7 +458,7 @@ class Transaction:
                 except Exception: # tested
                     result = ResourceError.snap_exception(
                                     participant_index = participant_index,
-                                    recoverable = False, terminal = True)
+                                    recoverable = not resource_in_transaction, terminal = True)
                     resource_instance.expire()
                     break # while True
                 else:
@@ -409,16 +470,7 @@ class Transaction:
 
             try:
 
-                # update the cache with the actual execution result
-
-                if cache_key is not None and result_to_cache is not None:
-                    try:
-                        resource_instance.cache_update(resource_pool.cache, cache_key, result_to_cache,
-                                                       pool__cache_weight = result_to_cache_weight) # the default weight is the execution time
-                    except:
-                        pmnc.log.warning(exc_string()) # log and ignore
-
-                # then deliver the result to the pending transaction
+                # deliver the result to the pending transaction
 
                 self._results.push((participant_index, result))
 
@@ -427,7 +479,8 @@ class Transaction:
                 pmnc.performance.event("resource.{0:s}.transaction_rate.{1:s}".\
                                        format(resource_name, resource_failed and "failure" or "success"))
 
-                # the result may have been taken from cache in which case commit is faked
+                # the result may have been taken from cache in which case there
+                # has been no transaction and we simply acknowledge the commit
 
                 if result is cached_result and cached_result is not None:
                     if pmnc.log.noise:
@@ -678,7 +731,7 @@ class Transaction:
 
 ###############################################################################
 
-def __getattr__(resource_name, *, __source_module_name):
+def __get_module_attr__(resource_name, *, __source_module_name):
 
     # this method executes a transaction with a single participant
 
@@ -789,29 +842,34 @@ def self_test():
 
         # success using cache
 
-        def to_cache(cache, key, value, **kwargs):
-            cache.put(key, value + " to cache", **kwargs)
+        cache = {}
 
-        def from_cache(cache, key):
+        def from_cache(key, **kwargs):
             value = cache.get(key)
             if value is not None:
                 return value + " from cache"
+
+        def to_cache(key, value, **kwargs):
+            if value is not None:
+                cache[key] = value + " to cache"
 
         def execute(res, *args, **kwargs):
             return "success"
         hooks = hooks_.copy(); hooks["execute"] = execute
 
         xa = pmnc.transaction.create()
-        xa.callable_4(execute = execute).execute(1, pool__cache_update = to_cache)
+        xa.callable_4(execute = execute).execute(1,
+            pool__cache_get = from_cache, pool__cache_put = to_cache)
         assert xa.execute() == ("success", )
 
         xa = pmnc.transaction.create()
-        xa.callable_4(execute = execute).execute(1, pool__cache_lookup = from_cache)
+        xa.callable_4(execute = execute).execute(1,
+            pool__cache_get = from_cache, pool__cache_put = to_cache)
         assert xa.execute() == ("success to cache from cache", )
 
         xa = pmnc.transaction.create()
         xa.callable_4(execute = execute).execute(2,
-            pool__cache_lookup = from_cache, pool__cache_update = to_cache)
+            pool__cache_get = from_cache, pool__cache_put = to_cache)
         assert xa.execute() == ("success", )
 
         # failure
@@ -853,25 +911,31 @@ def self_test():
         # failure using cache
 
         xa = pmnc.transaction.create()
-        xa.callable_4(execute = execute).execute(1, pool__cache_lookup = from_cache)
+        xa.callable_4(execute = execute).execute(1,
+            pool__cache_get = from_cache, pool__cache_put = to_cache)
         assert xa.execute() == ("success to cache from cache", )
 
         xa = pmnc.transaction.create()
-        xa.callable_4(execute = execute).execute(1, pool__cache_key = "not there")
+        xa.callable_4(execute = execute).execute(1,
+            pool__cache_key = "not there", pool__cache_get = from_cache, pool__cache_put = to_cache)
         with expected(ResourceError):
             xa.execute()
 
         xa = pmnc.transaction.create()
-        xa.callable_4(execute = execute).execute(1, pool__cache_key = lambda cache, attrs, args, kwargs: "still not there")
-        with expected(ResourceError):
+        xa.callable_4(execute = execute).execute(1,
+            pool__cache_key = lambda attrs, args, kwargs: "still not there",
+            pool__cache_get = from_cache, pool__cache_put = to_cache)
+        with expected(ResourceError) as e:
             xa.execute()
 
         xa = pmnc.transaction.create()
-        xa.callable_4(execute = execute).execute(2)
-        assert xa.execute() == ("success to cache", )
+        xa.callable_4(execute = execute).execute(2,
+            pool__cache_get = from_cache, pool__cache_put = to_cache)
+        assert xa.execute() == ("success to cache from cache", )
 
         xa = pmnc.transaction.create()
-        xa.callable_4(execute = execute).execute(3)
+        xa.callable_4(execute = execute).execute(3,
+            pool__cache_get = from_cache, pool__cache_put = to_cache)
         with expected(ResourceError):
             xa.execute()
 
@@ -1506,7 +1570,9 @@ def test():
     return r1, r2, r3
 
 # EOF
-""")
+""");
+
+        sleep(1.0)
 
         r1, r2, r3 = pmnc.test_smn.test()
         assert r1 == r2 == r3 == "value"

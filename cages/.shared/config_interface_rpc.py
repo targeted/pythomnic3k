@@ -29,6 +29,8 @@ random_port = -63000,                                   # tcp, negative means "i
 max_connections = 100,                                  # tcp
 broadcast_address = ("0.0.0.0/255.255.255.255", 12480), # rpc, "interface address/broadcast address", port
 flock_id = "DEFAULT",                                   # rpc
+marshaling_methods = ("msgpack", "pickle"),             # rpc, allowed marshaling methods
+max_packet_size = 1048576,                              # rpc, maximum allowed request/response size in bytes
 )
 
 # DO NOT TOUCH BELOW THIS LINE

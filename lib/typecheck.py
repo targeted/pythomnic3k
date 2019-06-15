@@ -4,7 +4,7 @@
 #
 # Parameter/return value type checking for Python 3 using function annotations.
 #
-# (c) 2008-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2008-2016, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license.
 #
 # Samples:
@@ -41,6 +41,10 @@
 #     ...
 #
 # @typecheck
+# def contains(x: int, xs: set_of(int)) -> bool:
+#     ...
+#
+# @typecheck
 # def set_level(level: one_of(1, 2, 3)):
 #     ...
 #
@@ -70,7 +74,7 @@ __all__ = [
 # check predicates
 
 "optional", "with_attr", "by_regex", "callable", "anything", "nothing",
-"tuple_of", "list_of", "dict_of", "one_of", "either",
+"tuple_of", "list_of", "set_of", "dict_of", "one_of", "either",
 
 # exceptions
 
@@ -230,29 +234,38 @@ by_regex = ByRegexChecker
 
 ################################################################################
 
-class TupleOfChecker(Checker):
+class ContainerChecker(Checker):
 
     def __init__(self, check):
         self._check = Checker.create(check)
 
     def check(self, value):
-        return isinstance(value, tuple) and \
+        return isinstance(value, self.container) and \
                functools.reduce(lambda r, v: r and self._check.check(v), value, True)
+
+################################################################################
+
+class TupleOfChecker(ContainerChecker):
+
+    container = tuple
 
 tuple_of = TupleOfChecker
 
 ################################################################################
 
-class ListOfChecker(Checker):
+class ListOfChecker(ContainerChecker):
 
-    def __init__(self, check):
-        self._check = Checker.create(check)
-
-    def check(self, value):
-        return isinstance(value, list) and \
-               functools.reduce(lambda r, v: r and self._check.check(v), value, True)
+    container = list
 
 list_of = ListOfChecker
+
+################################################################################
+
+class SetOfChecker(ContainerChecker):
+
+    container = set
+
+set_of = SetOfChecker
 
 ################################################################################
 
@@ -303,8 +316,15 @@ either = EitherChecker
 def typecheck(method, *, input_parameter_error = InputParameterError,
                          return_value_error = ReturnValueError):
 
-    argspec = inspect.getfullargspec(method)
-    if not argspec.annotations or not _enabled:
+    if not _enabled:
+        return method
+
+    original_method = method
+    while hasattr(original_method, "__wrapped__"):
+        original_method = original_method.__wrapped__
+
+    argspec = inspect.getfullargspec(original_method)
+    if not argspec.annotations:
         return method
 
     default_arg_count = len(argspec.defaults or [])
@@ -336,6 +356,7 @@ def typecheck(method, *, input_parameter_error = InputParameterError,
                                                   "with its typecheck".format(n))
             arg_checkers[i] = (n, checker)
 
+    @functools.wraps(method)
     def typecheck_invocation_proxy(*args, **kwargs):
 
         for check, arg in zip(arg_checkers, args):
@@ -361,8 +382,10 @@ def typecheck(method, *, input_parameter_error = InputParameterError,
 
         return result
 
-    return functools.update_wrapper(typecheck_invocation_proxy, method,
-                                    assigned = ("__name__", "__module__", "__doc__"))
+    if not hasattr(typecheck_invocation_proxy, "__wrapped__"):
+        typecheck_invocation_proxy.__wrapped__ = method
+
+    return typecheck_invocation_proxy
 
 ################################################################################
 
@@ -1681,6 +1704,35 @@ if __name__ == "__main__":
 
     assert not list_of(optional(by_regex("^foo$")))(["123", None, "foo"]) and \
            not list_of(optional(by_regex("^foo$"))).check(["123", None, "foo"])
+
+    ###################
+
+    print("ok")
+
+    ############################################################################
+
+    print("set_of: ", end = "")
+
+    ###################
+
+    @typecheck
+    def foo(xs: set_of(int), x) -> set_of(int):
+        xs = xs.copy()
+        xs.add(x)
+        return xs
+
+    assert foo(set(), 0) == {0}
+    assert foo({1, 2, 3}, 2) == {1, 2, 3}
+    assert foo({1, 2, 3}, 4) == {1, 2, 3, 4}
+
+    with expected(InputParameterError("foo() has got an incompatible value for xs: None")):
+        foo(None, 1)
+
+    with expected(InputParameterError("foo() has got an incompatible value for xs: ()")):
+        foo((), 0)
+
+    with expected(ReturnValueError("foo() has returned an incompatible value: {1, 2, 3, None}")):
+        foo({1, 2, 3}, None)
 
     ###################
 

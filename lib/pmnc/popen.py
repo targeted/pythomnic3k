@@ -11,7 +11,7 @@
 # "no inheritance" flag seems to be the only practical solution.
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ################################################################################
@@ -22,9 +22,7 @@ __all__ = [ "popen", "fopen" ]
 
 import os; from os import open
 import subprocess; from subprocess import Popen, PIPE
-import sys; from sys import platform, version_info
-if version_info[:2] < (3, 2):
-    import threading; from threading import Lock
+import sys; from sys import platform
 
 if __name__ == "__main__": # add pythomnic/lib to sys.path
     import os; import sys
@@ -35,20 +33,14 @@ import typecheck; from typecheck import optional
 
 ################################################################################
 
-_Popen_lock = Lock() if version_info[:2] < (3, 2) else None
-
 def popen(*args, env: optional(dict) = None) -> Popen:
 
     command = [ str(arg) for arg in args ]
 
-    if _Popen_lock: _Popen_lock.acquire() # see http://bugs.python.org/issue2320
-    try:
-        if platform == "win32":
-            return Popen(command, stdin = PIPE, stdout = PIPE, stderr = PIPE, env = env) # win32 doesn't support close_fds with stream redirection
-        else:
-            return Popen(command, stdin = PIPE, stdout = PIPE, stderr = PIPE, env = env, close_fds = True)
-    finally:
-        if _Popen_lock: _Popen_lock.release()
+    if platform == "win32":
+        return Popen(command, stdin = PIPE, stdout = PIPE, stderr = PIPE, env = env) # win32 doesn't support close_fds with stream redirection
+    else:
+        return Popen(command, stdin = PIPE, stdout = PIPE, stderr = PIPE, env = env, close_fds = True)
 
 ################################################################################
 

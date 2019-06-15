@@ -30,7 +30,7 @@
 # the attempts to execute the call are repeated infinitely).
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -46,7 +46,7 @@ if __name__ == "__main__": # add pythomnic/lib to sys.path
     main_module_dir = os.path.dirname(sys.modules["__main__"].__file__) or os.getcwd()
     sys.path.insert(0, os.path.normpath(os.path.join(main_module_dir, "..", "..", "lib")))
 
-import typecheck; from typecheck import optional, by_regex
+import typecheck; from typecheck import optional, by_regex, either
 
 ###############################################################################
 
@@ -119,7 +119,7 @@ def transmit(target_cage: str, module: str, method: str, args: tuple, kwargs: di
 # this method accepts incoming retried calls to this cage from other cages
 # initiated in transmit above
 
-def accept(module: str, method: str, args: tuple, kwargs: dict, *,
+def accept(module: str, method: str, args: either(tuple, list), kwargs: dict, *,
            source_cage_id: valid_retry_id, retry_deadline: optional(int),
            **options):
 

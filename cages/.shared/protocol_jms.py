@@ -144,7 +144,7 @@ class Packet(dict):
                     continue
                 return bb, next_crc32
 
-        prev_line = None
+        curr_lines = []
         next_line_crc32 = get_next_line()
         if next_line_crc32 is None:
             return None
@@ -152,21 +152,22 @@ class Packet(dict):
         next_line, curr_crc32 = next_line_crc32
         while next_line:
             if next_line.startswith(b" "):
-                if prev_line is not None:
-                    prev_line += next_line[1:]
+                if curr_lines:
+                    curr_lines.append(next_line[1:])
                 else:
                     raise Exception("invalid folding")
             else:
-                if prev_line is not None:
-                    decode_line(prev_line)
-                prev_line = next_line
+                if curr_lines:
+                    decode_line(b"".join(curr_lines))
+                    del curr_lines[:]
+                curr_lines.append(next_line)
             next_line_crc32 = get_next_line(curr_crc32)
             if next_line_crc32 is None:
                 raise Exception("unexpected eof")
             next_line, curr_crc32 = next_line_crc32
 
-        if prev_line is not None:
-            decode_line(prev_line)
+        if curr_lines:
+            decode_line(b"".join(curr_lines))
 
         return cls(**params)
 
@@ -449,9 +450,12 @@ class Interface(AdapterHost): # JMS interface
 
                     while self._adapter_running():
 
-                        pkt = self._stdout_queue.pop(6.0) # adapter should be sending in a ping once in 3 seconds
+                        # even when the queue is idle, the adapter should be sending in a ping once in 3 seconds
+
+                        receive_timeout = Timeout(self._request_timeout + 3.0)
+                        pkt = receive_timeout.pop(self._stdout_queue)
                         if pkt is None:
-                            raise Exception("adapter process failed to send in a ping")
+                            raise Exception("adapter process failed to produce a message")
 
                         if "XPmncError" in pkt: # adapter reports error, abort
                             raise Exception(pkt["XPmncError"])
@@ -471,7 +475,7 @@ class Interface(AdapterHost): # JMS interface
                         elif request == "RECEIVE": # process an incoming message
                             message_id = pkt["JMSMessageID"]
                             if message_id not in self._processed_messages: # don't process the message again
-                                success = self._process_message(message_id, pkt)
+                                success = self._process_message(message_id, pkt, receive_timeout.remain)
                             else:
                                 success = True
                             response = Packet(XPmncResponse = success and "COMMIT" or "ROLLBACK",
@@ -490,7 +494,7 @@ class Interface(AdapterHost): # JMS interface
 
     # request processing in a message-oriented interface is rather straightforward
 
-    def _process_message(self, message_id, pkt):
+    def _process_message(self, message_id, pkt, request_timeout):
 
         message_text = pkt.pop("XPmncMessageText")
 
@@ -499,7 +503,7 @@ class Interface(AdapterHost): # JMS interface
                               if pkt.get("JMSCorrelationID") else "")
 
         request = pmnc.interfaces.begin_request(
-                    timeout = self._request_timeout,
+                    timeout = min(request_timeout, self._request_timeout),
                     interface = self._name, protocol = "jms",
                     parameters = dict(auth_tokens = dict()),
                     description = message_description)

@@ -7,7 +7,7 @@
 # for a limited amount of time.
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ################################################################################
@@ -18,7 +18,7 @@ __all__ = [ "Timeout" ]
 
 import threading; from threading import Lock, Event
 import time; from time import time
-import random; from random import normalvariate
+import random; from random import randint
 
 if __name__ == "__main__": # add pythomnic/lib to sys.path
     import os; import sys
@@ -32,10 +32,18 @@ import interlocked_queue; from interlocked_queue import InterlockedQueue
 
 class Timeout:
 
+    # because this is such an ubiquitous class, it is impractical to create
+    # a lock (hence OS object) for every instance, and since the time the lock
+    # is taken is very small, we can allocate a fixed pool of locks shared
+    # amongst all instances without seriously affecting concurrency
+
+    __lock_count = 100
+    __locks = [ Lock() for _ in range(__lock_count) ]
+
     @typecheck
     def __init__(self, timeout: float):
         self._timeout = timeout
-        self._lock = Lock()
+        self._lock = self.__locks[randint(0, self.__lock_count - 1)]
         self.reset()
 
     timeout = property(lambda self: self._timeout)
@@ -144,7 +152,7 @@ if __name__ == "__main__":
     assert not t.wait() and t.expired
 
     before = time()
-    Timeout(0.1).wait()
+    Timeout(0.11).wait()
     after = time()
     assert after - before >= 0.1
 
@@ -152,7 +160,7 @@ if __name__ == "__main__":
 
     ilq = InterlockedQueue()
 
-    t = Timeout(0.1)
+    t = Timeout(0.11)
 
     before = time()
     assert t.pop(ilq) is None

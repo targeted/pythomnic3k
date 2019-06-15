@@ -31,7 +31,7 @@
 # }
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ################################################################################
@@ -40,7 +40,7 @@ __all__ = [ "run", "active_interface" ]
 
 ###############################################################################
 
-import sys; from sys import stdout, version_info
+import sys; from sys import stdout
 import os; from os import path as os_path, mkdir, listdir, rmdir, remove, chmod, getenv
 import tempfile; from tempfile import mkdtemp
 import shutil; from shutil import copyfile, copytree, rmtree
@@ -186,7 +186,7 @@ def _stop_pmnc(pmnc):
 
 def run(*, required_dirs: optional(tuple_of(str)) = ()):
 
-    if sys.version_info[:2] >= (3, 3) and getenv("PYTHONHASHSEED") != "0":
+    if getenv("PYTHONHASHSEED") != "0":
         raise SystemExit("Running self-tests requires turning off hash randomization, "
                          "set environment variable PYTHONHASHSEED to 0.")
 

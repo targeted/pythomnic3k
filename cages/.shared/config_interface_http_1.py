@@ -12,6 +12,7 @@ max_connections = 100,                    # tcp
 ssl_key_cert_file = None,                 # ssl, optional filename
 ssl_ca_cert_file = None,                  # ssl, optional filename
 ssl_ciphers = None,                       # ssl, optional str
+ssl_protocol = None,                      # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
 response_encoding = "windows-1251",       # http
 original_ip_header_fields = (),           # http
 allowed_methods = ("GET", "POST"),        # http

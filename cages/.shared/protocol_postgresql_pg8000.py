@@ -35,7 +35,7 @@
 # insert_records, select_records = pmnc.transaction.postgresql_1.execute(...)
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -152,7 +152,10 @@ class Resource(SQLResource): # PostgreSQL resource
                 pmnc.log.info("<< OK")
 
         except ProgrammingError as e:
-            level, state, message = map(self._decode_message, e.args)
+            try:
+                level, state, message = map(self._decode_message, e.args)
+            except:
+                state, message = "PG800", str(e)
             state = state.upper()
             pmnc.log.warning("<< {0:s}{1:s} !! PostgreSQL_Error(\"[{2:s}] {3:s}\") in {4:s}".\
                              format(sql, " -- ({0:s})".format(param_list)
@@ -233,7 +236,7 @@ class Resource(SQLResource): # PostgreSQL resource
 
     ###################################
 
-    _supported_types = SQLResource._supported_types | { float, timedelta }
+    _supported_types = SQLResource._supported_types | { float, timedelta, list }
 
     def _py_to_sql_bytes(self, v):
         return Bytea(SQLResource._py_to_sql_bytes(self, v))
@@ -252,6 +255,9 @@ class Resource(SQLResource): # PostgreSQL resource
 
     def _py_to_sql_Interval(self, v):
         return v
+
+    def _py_to_sql_list(self, el):
+        return [ self._py_to_sql(v) for v in el ]
 
     ###################################
 
@@ -274,6 +280,15 @@ class Resource(SQLResource): # PostgreSQL resource
                              microseconds = v.microseconds % 1000000)
         else:
             raise ValueError("month intervals cannot be converted")
+
+    def _sql_to_py_list(self, el):
+        pel = []
+        same = True
+        for v in el:
+            pv = self._sql_to_py(v)
+            pel.append(pv)
+            same = same and pv is v
+        return el if same else pel
 
     ###################################
 
@@ -558,7 +573,7 @@ def self_test():
 
         test_str()
 
-        # str
+        # bytes
 
         def test_bytes():
 
@@ -569,6 +584,33 @@ def self_test():
             assert test_value("bytea", r) == ([{'value': r}], [], [], [{'value': r}], [])
 
         test_bytes()
+
+        # list
+
+        def test_list():
+
+            assert test_value("int[]", None) == ([{'value': None}], [], [], [{'value': None}], [])
+            assert test_value("varchar[]", [ "foo" ]) == ([{'value': ['foo']}], [], [], [{'value': ['foo']}], [])
+
+            try:
+                test_value("varchar[]", [])
+            except SQLResourceError as e:
+                assert e.code is None and e.state == "PG800" and e.description == "array has no values"
+                assert e.recoverable and e.terminal
+            else:
+                assert False
+
+            try:
+                test_value("varchar[]", [ "foo", 123 ])
+            except SQLResourceError as e:
+                assert e.code is None and e.state == "PG800" and e.description == "not all array elements are of type <class 'str'>"
+                assert e.recoverable and e.terminal
+            else:
+                assert False
+
+            # doesn't seem to support multidimensional arrays
+
+        test_list()
 
     test_supported_types()
 

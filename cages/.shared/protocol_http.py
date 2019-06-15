@@ -15,6 +15,7 @@
 # ssl_key_cert_file = None,                                        # ssl, optional filename
 # ssl_ca_cert_file = None,                                         # ssl, optional filename
 # ssl_ciphers = None,                                              # ssl, optional str
+# ssl_protocol = None,                                             # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
 # response_encoding = "ascii",                                     # http
 # original_ip_header_fields = ("X-Forwarded-For", "X-Client-IP"),  # http
 # allowed_methods = ("GET", "POST"),                               # http
@@ -41,6 +42,9 @@
 # ssl_key_cert_file = None,                                        # ssl, optional filename
 # ssl_ca_cert_file = None,                                         # ssl, optional filename
 # ssl_ciphers = None,                                              # ssl, optional str
+# ssl_protocol = None,                                             # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+# ssl_server_hostname = None,                                      # ssl, optional str
+# ssl_ignore_hostname = False,                                     # ssl, ignore certificate common/alt name name mismatch
 # extra_headers = { "X-Foo": "Abc", "X-Bar": "Def" },              # http
 # http_version = "HTTP/1.1",                                       # http
 # )
@@ -57,7 +61,7 @@
 #     http_1.post("/", b"content", { "X-Biz": "Baz" })
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -91,7 +95,7 @@ if __name__ == "__main__": # add pythomnic/lib to sys.path
     sys.path.insert(0, os.path.normpath(os.path.join(main_module_dir, "..", "..", "lib")))
 
 import typecheck; from typecheck import typecheck, typecheck_with_exceptions, optional, \
-                                        callable, tuple_of, dict_of, by_regex
+                                        callable, tuple_of, dict_of, by_regex, one_of
 import exc_string; from exc_string import exc_string
 import pmnc.timeout; from pmnc.timeout import Timeout
 import pmnc.resource_pool; from pmnc.resource_pool import TransactionalResource, \
@@ -120,6 +124,7 @@ class Interface: # HTTP interface built on top of TCP pseudo-interface
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
                  response_encoding: str,
                  original_ip_header_fields: tuple_of(str),
                  allowed_methods: tuple_of(str),
@@ -159,7 +164,8 @@ class Interface: # HTTP interface built on top of TCP pseudo-interface
                                            max_connections = max_connections,
                                            ssl_key_cert_file = ssl_key_cert_file,
                                            ssl_ca_cert_file = ssl_ca_cert_file,
-                                           ssl_ciphers = ssl_ciphers)
+                                           ssl_ciphers = ssl_ciphers,
+                                           ssl_protocol = ssl_protocol)
 
     name = property(lambda self: self._tcp_interface.name)
     listener_address = property(lambda self: self._tcp_interface.listener_address)
@@ -729,6 +735,9 @@ class Resource(TransactionalResource): # HTTP resource
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
+                 ssl_server_hostname: optional(str) = None,
+                 ssl_ignore_hostname: optional(bool) = False,
                  extra_headers: _valid_headers,
                  http_version: _valid_http_version):
 
@@ -743,7 +752,10 @@ class Resource(TransactionalResource): # HTTP resource
                                           connect_timeout = connect_timeout,
                                           ssl_key_cert_file = ssl_key_cert_file,
                                           ssl_ca_cert_file = ssl_ca_cert_file,
-                                          ssl_ciphers = ssl_ciphers)
+                                          ssl_ciphers = ssl_ciphers,
+                                          ssl_protocol = ssl_protocol,
+                                          ssl_server_hostname = ssl_server_hostname,
+                                          ssl_ignore_hostname = ssl_ignore_hostname)
 
         if self._tcp_resource.encrypted:
             default_port = 443
@@ -865,8 +877,6 @@ def self_test():
     from binascii import b2a_base64
     from pmnc.request import fake_request
     from pmnc.self_test import active_interface
-    from sys import version_info
-    wrap_socket_has_ciphers = version_info[:2] >= (3, 2)
 
     rus_abc = "рст".encode("windows-1251")
 
@@ -1079,6 +1089,19 @@ def self_test():
                            if s.startswith(b"Content-Length: ")][0] + len(hdr) + 4
         return result
 
+    def compare_response(r1, r2):
+        h1, b1 = r1.split(b"\r\n\r\n")
+        h2, b2 = r2.split(b"\r\n\r\n")
+        assert b1 == b2
+        r1 = h1.split(b"\r\n")
+        r2 = h2.split(b"\r\n")
+        assert r1[0] == r2[0]
+        r1 = r1[1:]
+        r2 = r2[1:]
+        r1.sort()
+        r2.sort()
+        assert r1 == r2
+
     ###################################
 
     test_interface_config = dict \
@@ -1089,6 +1112,7 @@ def self_test():
     ssl_key_cert_file = None,
     ssl_ca_cert_file = None,
     ssl_ciphers = None,
+    ssl_protocol = None,
     response_encoding = "ascii",
     original_ip_header_fields = ("X-Forwarded-For", "X-Client-IP"),
     allowed_methods = ("GET", "POST"),
@@ -1151,14 +1175,16 @@ def self_test():
             # HTTP 2.0
 
             s = sendall(ifc, b"GET / HTTP/2.0\n\r\n") # mixed CRLFs are fine
-            assert recvall(s) == b"HTTP/1.1 505 HTTP Version Not Supported\r\nConnection: close\r\n" \
-                                 b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n"
+            compare_response(recvall(s),
+                             b"HTTP/1.1 505 HTTP Version Not Supported\r\nConnection: close\r\n"
+                             b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n")
 
             # invalid method
 
             s = sendall(ifc, b"DELETE / HTTP/1.0\r\n\r\n")
-            assert recvall(s) == b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n" \
-                                 b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n"
+            compare_response(recvall(s),
+                             b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n"
+                             b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n")
 
             # broken header
 
@@ -1186,8 +1212,9 @@ def self_test():
 
             s = sendall(ifc, b"GET / HTTP/1.0\r\nContent-Encoding: gzip\r\n\r\n")
             resp = recvall(s)
-            assert resp == b"HTTP/1.1 415 Unsupported Media Type\r\nConnection: close\r\n" \
-                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n"
+            compare_response(resp,
+                           b"HTTP/1.1 415 Unsupported Media Type\r\nConnection: close\r\n"
+                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n")
 
             # transfer-encoding: not supported, but results in a different kind of failure
 
@@ -1199,8 +1226,9 @@ def self_test():
 
             s = sendall(ifc, b"GET / HTTP/1.0\r\nRange: bytes=0-100\r\n\r\n")
             resp = recvall(s)
-            assert resp == b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n" \
-                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n"
+            compare_response(resp,
+                           b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n"
+                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n")
 
     test_interface_broken_requests()
 
@@ -1254,7 +1282,7 @@ def self_test():
 
             # basic authorization with two ip overrides
 
-            s = sendall(ifc, b"GET / HTTP/1.0\r\nX-CLIENT-IP: 1.2.3.4\r\nx-fOrWaRdEd-fOr: 5.6.7.8\r\n" \
+            s = sendall(ifc, b"GET / HTTP/1.0\r\nX-CLIENT-IP: 1.2.3.4\r\nx-fOrWaRdEd-fOr: 5.6.7.8\r\n"
                              b"Authorization: Basic Zm9vOmJhcg==\r\n\r\n") # foo:bar
             resp = recvall(s)
             auth_tokens = unpickle(resp.split(b"\r\n\r\n", 1)[1])
@@ -1305,24 +1333,27 @@ def self_test():
 
             s = sendall(ifc, b"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n\r\nfoo")
             resp = recvall(s)
-            assert resp ==  b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n" \
-                            b"Content-Type: application/octet-stream\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\nfoo" # fixme: different order in 3.4.0
+            compare_response(resp,
+                           b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n"
+                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\nContent-Type: application/octet-stream\r\n\r\nfoo")
 
             # encodes str using interface encoding
 
             s = sendall(ifc, b"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n"
                              b"X-Response-Type: text/plain\r\nX-Request-Encoding: ascii\r\n\r\nfoo")
             resp = recvall(s)
-            assert resp ==  b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n" \
-                            b"Content-Type: text/plain; charset=ascii\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\nfoo" # fixme: different order in 3.4.0
+            compare_response(resp,
+                           b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n"
+                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\nContent-Type: text/plain; charset=ascii\r\n\r\nfoo")
 
             # replacing unknown chars with "?"
 
             s = sendall(ifc, b"POST / HTTP/1.1\r\nContent-Length: 6\r\nContent-Type: text/plain\r\n"
                              b"X-Response-Type: text/plain\r\nX-Request-Encoding: windows-1251\r\n\r\nfoo" + rus_abc)
             resp = recvall(s)
-            assert resp ==  b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n" \
-                            b"Content-Type: text/plain; charset=ascii\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\nfoo???" # fixme: different order in 3.4.0
+            compare_response(resp,
+                           b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n"
+                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\nContent-Type: text/plain; charset=ascii\r\n\r\nfoo???")
 
             # can't return str + not text/*
 
@@ -1334,11 +1365,12 @@ def self_test():
 
             # but can return bytes + text/* (who cares)
 
-            s = sendall(ifc, b"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n" \
+            s = sendall(ifc, b"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n"
                              b"X-Response-Type: text/xml\r\n\r\nfoo")
             resp = recvall(s)
-            assert resp == b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n" \
-                           b"Content-Type: text/xml\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\nfoo" # fixme: different order in 3.4.0
+            compare_response(resp,
+                           b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n"
+                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\nContent-Type: text/xml\r\n\r\nfoo")
 
     test_interface_text_bytes()
 
@@ -1390,14 +1422,16 @@ def self_test():
             url = b2a_base64(pickle(headers)).decode("ascii").rstrip()
             s = sendall(ifc, "GET /{0:s} HTTP/1.0\r\n\r\n".format(url).encode("ascii"))
             resp = recvall(s)
-            assert resp == b"HTTP/1.1 200 OK\r\nConnection: close\r\nFoo: BAR\r\n" \
-                           b"Pragma: PRAGMA\r\nCache-Control: CACHE-CONTROL\r\n\r\n" # fixme: different order in 3.4.0
+
+            compare_response(resp,
+                           b"HTTP/1.1 200 OK\r\nConnection: close\r\nPragma: PRAGMA\r\n"
+                           b"Cache-Control: CACHE-CONTROL\r\nFoo: BAR\r\n\r\n")
 
             headers = { "cache-control": "max-age=60" }
             url = b2a_base64(pickle(headers)).decode("ascii").rstrip()
             s = sendall(ifc, "GET /{0:s} HTTP/1.0\r\n\r\n".format(url).encode("ascii"))
             resp = recvall(s)
-            assert resp == b"HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: max-age=60\r\n\r\n"
+            compare_response(resp, b"HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: max-age=60\r\n\r\n")
 
     test_response_headers()
 
@@ -1420,8 +1454,9 @@ def self_test():
 
             s = sendall(ifc, b"OPTIONS / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n")
             resp = recvall(s)
-            assert resp == b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n" \
-                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n"
+            compare_response(resp,
+                           b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n"
+                           b"Pragma: no-cache\r\nCache-Control: no-cache\r\n\r\n")
 
             # so do application-level exceptions
 
@@ -1456,22 +1491,26 @@ def self_test():
             # number of keep-alive requests over a single connections is limited
 
             s = sendall(ifc, b"GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n")
-            assert recvresp(s) == b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 10\r\n" \
-                                  b"Content-Type: application/octet-stream\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\nkeep-alive" # fixme: different order in 3.4.0
+            compare_response(recvresp(s),
+                             b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 10\r\n"
+                             b"Pragma: no-cache\r\nCache-Control: no-cache\r\nContent-Type: application/octet-stream\r\n\r\nkeep-alive")
 
             s.sendall(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n") # HTTP/1.0 client can have it too if asked
-            assert recvresp(s) == b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 10\r\n" \
-                                  b"Content-Type: application/octet-stream\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\nkeep-alive" # fixme: different order in 3.4.0
+            compare_response(recvresp(s),
+                             b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 10\r\n"
+                             b"Pragma: no-cache\r\nCache-Control: no-cache\r\nContent-Type: application/octet-stream\r\n\r\nkeep-alive")
 
             s.sendall(b"GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n")
-            assert recvall(s) == b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n" \
-                                 b"Content-Type: application/octet-stream\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\nclose" # fixme: different order in 3.4.0
+            compare_response(recvresp(s),
+                             b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n"
+                             b"Pragma: no-cache\r\nCache-Control: no-cache\r\nContent-Type: application/octet-stream\r\n\r\nclose")
 
             # keep-alive connection times out
 
             s = sendall(ifc, b"GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n")
-            assert recvresp(s) == b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 10\r\n" \
-                                  b"Content-Type: application/octet-stream\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\nkeep-alive" # fixme: different order in 3.4.0
+            compare_response(recvresp(s),
+                             b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 10\r\nPragma: no-cache\r\n"
+                             b"Cache-Control: no-cache\r\nContent-Type: application/octet-stream\r\n\r\nkeep-alive")
 
             sleep(4.0)
 
@@ -1541,6 +1580,9 @@ def self_test():
     ssl_key_cert_file = None,
     ssl_ca_cert_file = None,
     ssl_ciphers = None,
+    ssl_protocol = None,
+    ssl_server_hostname = None,
+    ssl_ignore_hostname = True,
     extra_headers = { "X-Foo": "Default", "X-Bar": "ABC" },
     http_version = "HTTP/1.1",
     )
@@ -1565,14 +1607,17 @@ def self_test():
         listener_address = property(lambda self: self._listener_address)
 
         def _respond(self):
-            assert select([self._s], [], [], 3.0)[0], "no connection"
-            s = self._s.accept()[0]
-            s.recv(1024)
-            s.sendall(self._response)
-            if self._close:
-                s.close()
-            else:
-                self.__class__._anchor_s = s
+            try:
+                assert select([self._s], [], [], 3.0)[0], "no connection"
+                s = self._s.accept()[0]
+                s.recv(1024)
+                s.sendall(self._response)
+                if self._close:
+                    s.close()
+                else:
+                    self.__class__._anchor_s = s
+            except:
+                pmnc.log.error(exc_string())
 
         def stop(self):
             self._th.join()
@@ -1646,16 +1691,18 @@ def self_test():
             responder_request("/", {}, b"HTTP/1.0 200 OK\n", False)
 
         with expected(Exception("invalid header field name")):
-            responder_request("/", {}, b"HTTP/1.0 200 OK\n$$$: ###\nfoo: bar\n", True)
+            responder_request("/", {}, b"HTTP/1.0 200 OK\n$$$: ###\nfoo: bar\n\n", True)
 
         with expected(Exception("invalid header field name")):
-            responder_request("/", {}, b"HTTP/1.0 200 OK\n$$$: ###\nfoo: bar\n", False)
+            responder_request("/", {}, b"HTTP/1.0 200 OK\n$$$: ###\nfoo: bar\n\n", False)
 
         with expected(Exception("invalid content length")):
             responder_request("/", {}, b"HTTP/1.0 200 OK\nContent-length:" + rus_abc + b"\n\n", True)
 
         with expected(Exception("invalid content length")):
             responder_request("/", {}, b"HTTP/1.0 200 OK\nContent-length:" + rus_abc + b"\n\n", False)
+
+        # these content-length tests tend to fail in presence of local firewall
 
         with expected(Exception("negative content length")):
             responder_request("/", {}, b"HTTP/1.0 200 OK\nContent-length:-2342342348762384762\n\n", True)
@@ -1845,7 +1892,10 @@ def self_test():
     connect_timeout = 1.0,
     ssl_key_cert_file = os_path.join(__cage_dir__, "ssl_keys", "key_cert.pem"),
     ssl_ca_cert_file = os_path.join(__cage_dir__, "ssl_keys", "ca_cert.pem"),
-    ssl_ciphers = wrap_socket_has_ciphers and "HIGH:!aNULL:!MD5" or None,
+    ssl_ciphers = "HIGH:!aNULL:!MD5",
+    ssl_protocol = "SSLv23",
+    ssl_server_hostname = None,
+    ssl_ignore_hostname = True,
     extra_headers = {},
     http_version = "HTTP/1.1",
     )
@@ -1857,7 +1907,8 @@ def self_test():
     max_connections = 100,
     ssl_key_cert_file = os_path.join(__cage_dir__, "ssl_keys", "key_cert.pem"),
     ssl_ca_cert_file = os_path.join(__cage_dir__, "ssl_keys", "ca_cert.pem"),
-    ssl_ciphers = wrap_socket_has_ciphers and "HIGH:!aNULL:!MD5" or None,
+    ssl_ciphers = "HIGH:!aNULL:!MD5",
+    ssl_protocol = "SSLv23",
     response_encoding = "ascii",
     original_ip_header_fields = (),
     allowed_methods = ("GET", ),
@@ -1911,6 +1962,9 @@ def self_test():
             resource_config_ssl["server_address"] = ifc.listener_address
             resource_config_ssl["ssl_key_cert_file"] = None
             resource_config_ssl["ssl_ciphers"] = None
+            resource_config_ssl["ssl_protocol"] = None
+            resource_config_ssl["ssl_server_hostname"] = None
+            resource_config_ssl["ssl_ignore_hostname"] = True
             rc = pmnc.protocol_http.Resource("loopback_ssl", **resource_config_ssl)
             rc.connect()
             try:

@@ -442,9 +442,8 @@ class RequestPDU(PDU):
 if __name__ == "__main__":
 
     from os import getenv
-    from sys import version_info
 
-    if sys.version_info[:2] >= (3, 3) and getenv("PYTHONHASHSEED") != "0":
+    if getenv("PYTHONHASHSEED") != "0":
         raise SystemExit("Running self-tests requires turning off hash randomization, "
                          "set environment variable PYTHONHASHSEED to 0.")
 

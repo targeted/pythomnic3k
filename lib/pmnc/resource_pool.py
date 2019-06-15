@@ -46,67 +46,11 @@
 # TransactionCommitError - thrown again by the transaction, in case one
 # of the participants fails to commit, which is considered serious failure.
 #
-# Caching:
-#
-# Any resource pool can be instrumented with a read cache. Its behaviour
-# is controlled by the following configuration parameters in the resource
-# configuration file:
-#
-# >> pool__cache_size = N,
-# Maximum number of cached entries to keep in the cache.
-#
-# >> pool__cache_policy = "...",
-# Eviction policy, string literal, one of "lru", "lfu", "weight", "old" or "random":
-# lru = evict entries least recently used
-# lfu = evict entries least (often) used
-# weight = evict entries that took least time to create (cheapest to regenerate)
-# old = evict entries that are to expire soon (FIFO-like)
-# random = evict entries at random
-#
-# >> pool__cache_default_ttl = N.N,
-# Default cached entry time to live in float seconds. None (default) means forever.
-#
-# >> pool__cache_evict_period = N.N,
-# Eviction can occur at most once in N.N float seconds. Default is 10.0 seconds.
-#
-# As soon as you specify pool__cache_size for a resource, a cache is enabled
-# and all identical requests will return the cached results. Identical are
-# two resource requests with identical methods, args and kwargs:
-#
-# xa.resource.foo(1, biz = "baz") # original
-# xa.resource.foo(1, biz = "baz") # identical
-# xa.resource.bar(1, biz = "baz") # different
-# xa.resource.foo(2, biz = "baz") # different
-# xa.resource.foo(1, baz = "biz") # different
-# xa.resource.foo(1, biz = "buz") # different
-#
-# You can control the cache behaviour by supplying the following kwargs
-# to the resource call:
-#
-# >> xa.resource.foo(1, biz = "baz", pool__cache_ttl = M.M)
-# The result of this particular call is cached for M.M seconds,
-# explicit None value means forever.
-#
-# >> xa.resource.foo(1, biz = "baz", pool__cache_weight = K.K)
-# The result of this particular call is marked with weight K.K,
-# which is used with "weight" eviction policy.
-#
-# >> xa.resource.foo(1, biz = "baz", pool__cache_key = "key")
-# The result of this particular call is cached under this literal key,
-# thus changing the above "identical" semantics. As an alternative,
-# a function could be passed for pool__cache_key, which then in turn
-# returns the actual key value.
-#
-# >> xa.resource.foo(1, biz = "baz", pool__cache_lookup = lambda: cache, key: ...)
-# Callable to override cache lookup behaviour altogether.
-# The default behaviour is something like cache.get(key)
-#
-# >> xa.resource.foo(1, biz = "baz", pool__cache_update = lambda: cache, key, value: ...)
-# Callable to override cache update behaviour altogether.
-# The default behaviour is something like cache.put(key, value)
+# Any resource pool can be instrumented with a read cache, its implementation
+# resides in a separate module, for more information see resource_pool_cache.py
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -124,21 +68,17 @@ import decimal; from decimal import Decimal, localcontext, Inexact
 import datetime; from datetime import datetime
 import collections; from collections import MutableMapping
 import sys; from sys import exc_info
-import time; from time import time
-import inspect; from inspect import isfunction
-import copy; from copy import deepcopy
-import heapq; from heapq import nsmallest
-import random; from random import randint
 
 if __name__ == "__main__": # add pythomnic/lib to sys.path
     import os; import sys
     main_module_dir = os.path.dirname(sys.modules["__main__"].__file__) or os.getcwd()
     sys.path.insert(0, os.path.normpath(os.path.join(main_module_dir, "..")))
 
-import typecheck; from typecheck import typecheck, callable, tuple_of, optional, one_of
+import typecheck; from typecheck import typecheck, callable, optional
 import pmnc.timeout; from pmnc.timeout import Timeout
 import pmnc.threads; from pmnc.threads import HeavyThread, LightThread
 import pmnc.request; from pmnc.request import Request
+import pmnc.resource_pool_cache; from pmnc.resource_pool_cache import ResourcePoolReadWriteCache
 
 ###############################################################################
 
@@ -378,79 +318,6 @@ class TransactionalResource(Resource):
     def rollback(self): # override
         pass
 
-    # default implementations of cache controlling methods,
-    # those are tested not here but in transaction.py and
-    # protocol_callable.py
-
-    class _no_cache_key: pass # tag
-    class _default_ttl: pass # tag
-    class _default_weight: pass # tag
-
-    def _cache_key(self, cache, attrs, args, kwargs):
-        return (tuple(attrs), args, frozenset(kwargs.items()))
-
-    # note that cache_key explicitly removes pool__cache_... parameters
-    # from kwargs passed as by reference dict so that they do not appear
-    # in actual resource execution
-
-    def cache_key(self, cache, attrs, args, kwargs):
-
-        cache_key = kwargs.pop("pool__cache_key", self._no_cache_key)
-        self.__cache_lookup = kwargs.pop("pool__cache_lookup", self._cache_lookup)
-        self.__cache_update = kwargs.pop("pool__cache_update", self._cache_update)
-        self.__cache_ttl = kwargs.pop("pool__cache_ttl", self._default_ttl)
-        self.__cache_weight = kwargs.pop("pool__cache_weight", self._default_weight)
-
-        # this method is called from transaction even if caching is disabled for
-        # a resource and it exits right after the meta parameters have been removed
-
-        if not cache:
-
-            # custom implementations of caching could be using their own custom
-            # parameters, presumably named pool__cache_... therefore we remove
-            # them in case caching is disabled
-
-            custom_kwargs = { k for k in kwargs.keys() if k.startswith("pool__cache_") }
-            for k in custom_kwargs:
-                del kwargs[k]
-
-            return None
-
-        # a key could either be a literal value or a function returning one
-
-        if isfunction(cache_key):
-            cache_key = cache_key(cache, attrs, args, kwargs)
-
-        if cache_key is not self._no_cache_key:
-            return cache_key # this can return None if explicitly requested by the caller
-        else:
-            return self._cache_key(cache, attrs, args, kwargs)
-
-    # note that cache_lookup does not see the removed pool__cache_... parameters
-
-    def _cache_lookup(self, cache, key):
-        return cache.get(key)
-
-    def cache_lookup(self, cache, key):
-        return self.__cache_lookup(cache, key)
-
-    # note that cache_update sees the removed pool__cache_... parameters
-
-    def _cache_update(self, cache, key, value, **kwargs):
-        cache.put(key, value, **kwargs)
-
-    def cache_update(self, cache, key, value, **kwargs):
-
-        # parameters from cache_key are inserted back if there were specified
-
-        if self.__cache_ttl is not self._default_ttl:
-            kwargs["pool__cache_ttl"] = self.__cache_ttl
-
-        if self.__cache_weight is not self._default_weight:
-            kwargs["pool__cache_weight"] = self.__cache_weight
-
-        self.__cache_update(cache, key, value, **kwargs)
-
 ###############################################################################
 
 class SQLRecord(MutableMapping): # this is essentially a UserDict with case-insensitive keys
@@ -632,170 +499,11 @@ class ResourcePoolStopped(Exception): pass
 
 ###############################################################################
 
-class ResourcePoolCache:
-
-    class CachedValue:
-
-        @typecheck
-        def __init__(self, value, *, ttl: optional(float) = None, weight: optional(float) = None):
-            self._value = deepcopy(value)
-            self._timeout = Timeout(ttl) if ttl else None
-            self._weight = weight
-            self._use_count = 0
-            self.touch()
-
-        value = property(lambda self: deepcopy(self._value))
-        expired = property(lambda self: self._timeout.expired if self._timeout is not None else False)
-        ttl = property(lambda self: self._timeout.remain if self._timeout is not None else None)
-        weight = property(lambda self: self._weight)
-        last_used = property(lambda self: self._last_used)
-        use_count = property(lambda self: self._use_count)
-
-        def touch(self):
-            self._last_used = time() # note that usage has nothing to do with expiration
-            self._use_count += 1
-
-    _default_evict_period = 10.0
-
-    @typecheck
-    def __init__(self, name: str, *,
-                 size: optional(int) = None,
-                 policy: optional(one_of("lru", "lfu", "weight", "old", "random")) = None,
-                 default_ttl: optional(float) = None,
-                 evict_period: optional(float) = None):
-
-        self._name = name
-        self._size = size # can be None meaning unrestricted
-        self._policy = policy or "lru"
-        self._default_ttl = default_ttl # can be None meaning unspecified
-        self._evict_period = evict_period or self._default_evict_period
-
-        self._evict_key = getattr(self, "_evict_{0:s}".format(self._policy))
-        self._evict_timeout = Timeout(self._evict_period)
-        self._lock, self._cache = Lock(), {}
-        self._sync_lock = Lock()
-
-    name = property(lambda self: self._name)
-    size = property(lambda self: self._size)
-    policy = property(lambda self: self._policy)
-    default_ttl = property(lambda self: self._default_ttl)
-    evict_period = property(lambda self: self._evict_period)
-
-    # utility method to set caching parameters on per-value basis
-
-    def _wrap(self, value, **kwargs):
-        return self.CachedValue(value,
-            ttl = kwargs.get("pool__cache_ttl", self._default_ttl),
-            weight = kwargs.get("pool__cache_weight"))
-
-    def _evict(self):
-        if self._evict_timeout.expired:
-            try:
-                if self._size:
-                    evict_count = len(self._cache) - self._size
-                    if evict_count > 0:
-                        now = time()
-                        for k, _ in nsmallest(evict_count, self._cache.items(),
-                                        key = lambda k_v: self._evict_key(k_v[1], now)):
-                            del self._cache[k]
-            finally:
-                self._evict_timeout.reset()
-
-    # the following methods are comparison keys which return smaller values for preferred eviction
-
-    # least recently used, remove entries that have not been used for a while
-
-    def _evict_lru(self, v, now):
-        return v.last_used - now
-
-    # least (frequently) used, remove entries that have seldom been used
-
-    def _evict_lfu(self, v, _):
-        return v.use_count
-
-    # remove cheapest entries (that it took least time to generate), note that values with unspecified weight get removed last
-
-    def _evict_weight(self, v, _):
-        return v.weight if v.weight is not None else float("inf")
-
-    # remove entries that are to expire soon, note that values that never expire get removed last
-
-    def _evict_old(self, v, _):
-        return v.ttl if v.ttl is not None else float("inf")
-
-    # remove entries at random
-
-    def _evict_random(self, v, _):
-        return randint(0, 2147483647)
-
-    # protocol methods
-
-    def __getitem__(self, k):
-        with self._lock:
-            self._evict()
-            cv = self._cache[k]
-            if cv.expired:
-                del self._cache[k]
-                raise KeyError(k)
-        cv.touch()
-        return cv.value
-
-    def get(self, k, d = None):
-        try:
-            return self[k]
-        except KeyError:
-            return d
-
-    def __setitem__(self, k, v):
-        with self._lock:
-            self._evict()
-            if isinstance(v, self.CachedValue):
-                self._cache[k] = v
-            else:
-                self._cache[k] = self._wrap(v)
-
-    def put(self, k, v, **kwargs):
-        self[k] = self._wrap(v, **kwargs)
-
-    def __delitem__(self, k):
-        with self._lock:
-            self._evict()
-            del self._cache[k]
-
-    # called by the sweep thread
-
-    def purge(self):
-        with self._lock:
-            self._evict()
-            self._cache = { k: v for k, v in self._cache.items() if not v.expired }
-
-    # used to make atomic accesses
-
-    def lock(self):
-        self._sync_lock.acquire()
-
-    def unlock(self):
-        self._sync_lock.release()
-
-    def __enter__(self):
-        self.lock()
-
-    def __exit__(self, t, v, tb):
-        self.unlock()
-
-    # debugging aid
-
-    def __iter__(self):
-        with self._lock:
-            return iter([ (k, v.value) for k, v in self._cache.items() ])
-
-###############################################################################
-
 class ResourcePool: # a fixed size pool of resources
 
     @typecheck
     def __init__(self, name: str, factory: callable, size: int = 2147483647,
-                 standby: int = 0, cache: optional(ResourcePoolCache) = None):
+                 standby: int = 0, cache: optional(ResourcePoolReadWriteCache) = None):
         self._name, self._factory, self._size, self._standby = name, factory, size, min(size, standby)
         self._lock, self._stopped = Lock(), False
         self._free, self._busy, self._count = [], [], 0
@@ -803,7 +511,7 @@ class ResourcePool: # a fixed size pool of resources
 
     name = property(lambda self: self._name)
     size = property(lambda self: self._size)
-    cache = property(lambda self: self._cache)
+    has_cache = property (lambda self: self._cache is not None)
 
     def rfree(self):
         with self._lock:
@@ -842,7 +550,7 @@ class ResourcePool: # a fixed size pool of resources
 
     ###################################
     # this method returns a connected instance of a resource,
-    # either from a free list, or freshly created, note how
+    # either from a free list or freshly created, note how
     # the connection is established outside the lock
 
     @typecheck
@@ -875,32 +583,49 @@ class ResourcePool: # a fixed size pool of resources
     @typecheck
     def release(self, resource: Resource):
         if not resource.expired:
-            with self._lock:
-                try:
-                    self._busy.remove(resource)
-                except ValueError:
-                    pass
-                else:
-                    self._free.append(resource)
+            self._release(resource)
         else:
             self._disconnect(resource)
         self.warmup()
 
-    ###################################
-    # this method is called periodically by the watchdog thread
-    # to remove the expired resources from the free pool
+    def _release(self, resource):
+        with self._lock:
+            try:
+                self._busy.remove(resource)
+            except ValueError:
+                pass
+            else:
+                self._free.append(resource)
 
-    def sweep(self):
-        return self._spawn_thread(self._sweep)
+    ###################################
+    # this method is called periodically by the maintenance thread to remove
+    # the expired resources from the free pool, warm the pool up and purge its cache
+
+    def maintain(self):
+        return self._spawn_thread(self._maintain)
+
+    def _maintain(self):
+        self._sweep()
+        self._warmup()
+        if self._cache:
+            self._purge_cache()
+
+    ###################################
+    # this method is called from the periodic maintenance above
+    # by a new one-time thread each time, and it should not throw
 
     def _sweep(self):
 
         if self._sweep_sem.acquire(blocking = False): # allow only one thread to be sweeping the pool
-            try:
+            try:                                      # the second thread to arrive simply does nothing
                 while True:
                     with self._lock:
                         for resource in self._free:
-                            if resource.expired:
+                            try:
+                                expired = resource.expired
+                            except:
+                                expired = True
+                            if expired:
                                 self._free.remove(resource)
                                 self._busy.append(resource)
                                 break # for
@@ -910,19 +635,11 @@ class ResourcePool: # a fixed size pool of resources
             finally:
                 self._sweep_sem.release()
 
-        # the same thread is also performing pool warmup
-
-        self._warmup()
-
-        # and cache purging
-
-        if self._cache: self._cache.purge()
-
     _sweep_sem = Semaphore()
 
     ###################################
-    # this method is called periodically by the watchdog thread
-    # to keep a few free resources available in the free pool
+    # this method is called upon allocation/deallocation of resource
+    # instances by the worker threads, and it should not throw
 
     def warmup(self):
         with self._lock:
@@ -930,31 +647,48 @@ class ResourcePool: # a fixed size pool of resources
                 return
         return self._spawn_thread(self._warmup)
 
+    def _warmup_required(self): # self._lock must be held to use this
+        return len(self._free) < self._standby and \
+               len(self._free) + len(self._busy) < self._size
+
+    # this method is called either from the periodic maintenance above
+    # by a new one-time thread or by a allocate/release worker thread,
+    # and it should not throw
+
     def _warmup(self):
         if self._warmup_sem.acquire(blocking = False): # allow only one thread to be warming the pool up
-            try:
+            try:                                       # the second thread to arrive simply does nothing
                 while True:
                     with self._lock:
                         if self._stopped or not self._warmup_required():
                             return
-                        resource = self._create()
-                        self._busy.append(resource)
-                    try:
+                        try:
+                            resource = self._create()
+                        except:
+                            return # creation failed, bail out
+                        self._busy.append(resource) # the un-yet-connected resource is put on the
+                    try:                            # busy list to prevent resource overallocation
                         self._connect(resource)
                     except:
                         return # connection failed, bail out
-                    else:
-                        self.release(resource)
+                    self._release(resource)
             finally:
                 self._warmup_sem.release()
 
     _warmup_sem = Semaphore()
 
-    # self._lock must be held to use this
+    ###################################
+    # this method is called from the periodic maintenance above
+    # by a new one-time thread each time, and it should not throw
 
-    def _warmup_required(self):
-        return len(self._free) < self._standby and \
-               len(self._free) + len(self._busy) < self._size
+    def _purge_cache(self):
+        if self._purge_sem.acquire(blocking = False): # allow only one thread to be purging the cache
+            try:                                      # the second thread to arrive simply does nothing
+                self._cache.purge()
+            finally:
+                self._purge_sem.release()
+
+    _purge_sem = Semaphore()
 
     ###################################
     # this method is called by the watchdog thread
@@ -969,14 +703,15 @@ class ResourcePool: # a fixed size pool of resources
                 with self._lock:
                     self._stopped = True
                     for resource in self._free + self._busy:
-                        resource.expire()
-            finally:
+                        resource.expire() # all the resource instances are marked as expired
+            finally:                      # and then the entire pool is swept thus diconnecting them
                 self._stop_sem.release()
             self._sweep() # the same thread is entering _sweep, only if it has succeeded with stopping
 
     _stop_sem = Semaphore()
 
     ###################################
+    # utility method for launching one-time threads
 
     def _spawn_thread(self, proc):
         proc_name = "{0:s}:{1:s}".format(self.name, proc.__name__[1:])
@@ -985,10 +720,17 @@ class ResourcePool: # a fixed size pool of resources
         th.start()
         return th
 
-################################################################################
+    ###################################
 
+    def cache_get(self, key, **kwargs):
+        return self._cache.get(key, **kwargs)
+
+    def cache_put(self, key, value, **kwargs):
+        self._cache.put(key, value, **kwargs)
+
+################################################################################
 # all instances of this descendant class are registered in a global list
-# and are periodically swept, having their expired resources disconnected
+# and are subject to periodic maintenance
 
 class RegisteredResourcePool(ResourcePool):
 
@@ -997,41 +739,48 @@ class RegisteredResourcePool(ResourcePool):
 
     def __init__(self, *args, **kwargs):
         with self._pools_lock:
-            if not self._sweeper.is_alive():
+            if not self._maintainer.is_alive():
                 raise ResourcePoolStopped("all resource pools are stopped")
             ResourcePool.__init__(self, *args, **kwargs)
             self._pools.append(self)
 
-    ################################### a separate thread schedules sweeping and stopping
+    ################################### a separate thread schedules pool maintenance and stopping
 
     @classmethod
     def start_pools(cls, pools_sweep_period):
-        cls._pools_sweep_period = pools_sweep_period
-        cls._sweeper = HeavyThread(target = cls._sweeper_proc, name = "resource_pool:swp")
-        cls._sweeper.start()
+        cls._pools_maintenance_period = pools_sweep_period # maintenance used to be just sweeping
+        cls._maintainer = HeavyThread(target = cls._maintainer_proc, name = "resource_pool:mnt")
+        cls._maintainer.start()
 
     @classmethod
     def stop_pools(cls):
-        if hasattr(cls, "_sweeper"): # has started
-            cls._sweeper.stop()
+        if hasattr(cls, "_maintainer"): # has started
+            cls._maintainer.stop()
 
     @classmethod
-    def _sweeper_proc(cls):
-        timeout = cls._pools_sweep_period
+    def _maintainer_proc(cls):
+
+        # this is the lifetime loop
+
+        timeout = cls._pools_maintenance_period
         interval = timeout
-        while not current_thread().stopped(interval): # keep periodically sweeping the registered pools
+        while not current_thread().stopped(interval): # perform periodic maintenance of the registered pools
             with cls._pools_lock:
-                interval = timeout / (len(cls._pools) or 1)
+                interval = timeout / (len(cls._pools) or 1) # spreading the calls evenly over the interval
                 if not cls._pools:
                     continue
-                pool = cls._pools.pop(0)
+                pool = cls._pools.pop(0) # pop/append are used to loop over the volatile list
             try:
-                pool.sweep()
+                pool.maintain()
             finally:
                 with cls._pools_lock:
                     cls._pools.append(pool)
+
+        # and now the cage is being stopped
+
         with cls._pools_lock: # stop the registered pools
             pools, cls._pools = cls._pools, []
+
         ths = [ pool.stop() for pool in pools ]
         timeout = Timeout(timeout)
         for th in ths:
@@ -1047,7 +796,7 @@ if __name__ == "__main__":
 
     ###################################
 
-    from time import sleep
+    from time import time, sleep
     from random import random
     from expected import expected
     from typecheck import InputParameterError, ReturnValueError, by_regex
@@ -1055,277 +804,6 @@ if __name__ == "__main__":
     from collections import OrderedDict
 
     ###################################
-
-    # test cached value
-
-    rpc = ResourcePoolCache("name", size = 1, policy = "lru", default_ttl = 10.0)
-
-    ########
-
-    cv = rpc._wrap("biz")
-
-    assert cv.value == "biz"
-    assert cv.weight is None
-    assert not cv.expired
-    assert cv.ttl > 9.0
-    assert time() - cv.last_used < 0.5
-    assert cv.use_count == 1
-
-    sleep(1.5)
-
-    assert not cv.expired
-    assert cv.value == "biz"
-    assert cv.weight is None
-    assert cv.ttl > 7.0
-    assert time() - cv.last_used < 2.5
-    assert cv.use_count == 1
-
-    ########
-
-    cv = rpc._wrap("foo", pool__cache_ttl = 1.0, pool__cache_weight = 0.21)
-
-    assert cv.value == "foo"
-    assert cv.weight == 0.21
-    assert not cv.expired
-    assert 0.5 < cv.ttl < 1.5
-    assert time() - cv.last_used < 0.5
-    assert cv.use_count == 1
-
-    sleep(1.5)
-
-    assert cv.expired
-    assert cv.value == "foo"
-    assert cv.weight == 0.21
-    assert cv.ttl == 0.0
-    assert time() - cv.last_used > 1.0
-    assert cv.use_count == 1
-
-    cv.touch()
-
-    assert cv.expired
-    assert time() - cv.last_used < 0.5
-    assert cv.use_count == 2
-
-    ########
-
-    cv = rpc._wrap("bar", pool__cache_ttl = None)
-
-    assert cv.value == "bar"
-    assert not cv.expired
-    assert cv.ttl is None
-    assert time() - cv.last_used < 0.5
-    assert cv.use_count == 1
-
-    sleep(1.5)
-
-    assert not cv.expired
-    assert cv.ttl is None
-    assert time() - cv.last_used > 1.0
-    assert cv.use_count == 1
-
-    ###################################
-
-    # test cache
-
-    # basic expiration
-
-    rpc = ResourcePoolCache("name", size = 3, policy = "lru")
-    assert rpc.evict_period == ResourcePoolCache._default_evict_period
-
-    assert rpc.name == "name"
-    assert rpc.size == 3
-    assert rpc.policy == "lru"
-
-    with expected(KeyError("foo")):
-        rpc["foo"]
-
-    assert rpc.get("foo") is None
-    assert rpc.get("foo", "default") == "default"
-
-    rpc.put("foo", "bar", pool__cache_ttl = 1.0)
-    assert rpc["foo"] == "bar"
-
-    sleep(1.5)
-
-    with expected(KeyError("foo")):
-        rpc["foo"]
-
-    rpc["biz"] = "baz"
-    del rpc["biz"]
-
-    with expected(KeyError("biz")):
-        rpc["biz"]
-
-    # test eviction
-
-    def populate(policy):
-
-        rpc = ResourcePoolCache("name", size = 3, policy = policy, default_ttl = 10.0, evict_period = 1.0)
-
-        rpc[1] = 1
-        rpc.put(2, 2, pool__cache_weight = 0.5)
-        rpc.put(3, 3, pool__cache_weight = 0.25)
-        rpc[4] = rpc._wrap(4, pool__cache_weight = 0.75)
-
-        for i in range(4): assert rpc[1] == 1
-        sleep(0.1)
-        for i in range(3): assert rpc[2] == 2
-        sleep(0.1)
-        rpc[1]
-        sleep(0.1)
-        for i in range(2): assert rpc[3] == 3
-        sleep(0.1)
-        for i in range(1): assert rpc[4] == 4
-
-        sleep(1.0)
-
-        return rpc
-
-    ###
-
-    rpc = populate("lru")
-
-    assert rpc[1] == 1
-    with expected(KeyError(2)):
-        rpc[2]
-    assert rpc[3] == 3
-    assert rpc[4] == 4
-
-    ###
-
-    rpc = populate("lfu")
-
-    assert rpc[1] == 1
-    assert rpc[2] == 2
-    assert rpc[3] == 3
-    with expected(KeyError(4)):
-        rpc[4]
-
-    ###
-
-    rpc = populate("weight")
-
-    assert rpc[1] == 1
-    assert rpc[2] == 2
-    with expected(KeyError(3)):
-        rpc[3]
-    assert rpc[4] == 4
-
-    ###
-
-    rpc = populate("old")
-
-    with expected(KeyError(1)):
-        rpc[1]
-    assert rpc[2] == 2
-    assert rpc[3] == 3
-    assert rpc[4] == 4
-
-    ###
-
-    f = None
-
-    for i in range(10):
-
-        rpc = populate("random")
-        for k in range(1, 5):
-            try:
-                rpc[k]
-            except KeyError:
-                if f is None:
-                    f = k
-                elif f != k:
-                    break
-        else:
-            continue
-
-        break
-
-    else:
-        assert False
-
-    ###
-
-    rpc = ResourcePoolCache("name", size = 1, policy = "old", evict_period = 1.0)
-    assert rpc.default_ttl is None
-    assert rpc.evict_period == 1.0
-
-    rpc.put(1, rpc._wrap(1))
-    rpc.put(2, rpc._wrap(2))
-
-    assert len(rpc._cache) == 2
-
-    rpc[1]; rpc[2]
-
-    sleep(1.5)
-
-    try:
-        rpc[1]; rpc[2]
-    except KeyError:
-        pass
-
-    assert len(rpc._cache) == 1
-
-    # purging
-
-    rpc = ResourcePoolCache("name", size = 3, policy = "lru", default_ttl = 10.0)
-
-    rpc[1] = rpc._wrap(1, pool__cache_ttl = 1.0)
-    rpc.put(2, 2, pool__cache_ttl = 1.0)
-    rpc[3] = rpc._wrap("never expires 1", pool__cache_ttl = None)
-    rpc.put(4, "never expires 2", pool__cache_ttl = None)
-    assert len(rpc._cache) == 4
-
-    rpc.purge()
-    assert len(rpc._cache) == 4
-
-    sleep(1.5)
-
-    rpc.purge()
-    assert len(rpc._cache) == 2
-
-    # locking
-
-    with rpc:
-        rpc[1] = 1
-        rpc[2] = 2
-
-    # cached values are copied
-
-    rpc = ResourcePoolCache("foo", size = 1)
-
-    original_value = SQLRecord({ "mutable": "original value" })
-    rpc["key"] = original_value
-
-    original_value["mutable"] = "modified original value"
-    assert original_value["mutable"] == original_value["MUTABLE"] == "modified original value"
-
-    value1 = rpc["key"]
-    assert isinstance(value1, SQLRecord)
-    value2 = rpc["key"]
-    assert isinstance(value2, SQLRecord)
-    assert value1 is not value2 and value1._keys is not value2._keys and value1.data is not value2.data
-
-    value1["mutable"] = "modified cached value"
-    assert value1["mutable"] == value1["MUTABLE"] == "modified cached value"
-    assert value2["mutable"] == value2["MUTABLE"] == "original value"
-
-    # cached values iteration
-
-    rpc = ResourcePoolCache("foo", size = 3)
-
-    with expected(StopIteration):
-        next(iter(rpc))
-
-    rpc["key1"] = "foo"
-    i = iter(rpc)
-    rpc["key2"] = "bar"
-
-    assert set(i) == { ("key1", "foo") }
-    assert set(rpc) == { ("key1", "foo"), ("key2", "bar") }
-
-    ###################################
-
     # test errors
 
     try:
@@ -1615,7 +1093,7 @@ if __name__ == "__main__":
 
     assert rp.free == 5 and rp.busy == 0
 
-    rp.sweep().join()
+    rp.maintain().join()
 
     assert rp.free == 2 and rp.busy == 0
 
@@ -1664,7 +1142,7 @@ if __name__ == "__main__":
 
     r3.expire()
 
-    rp.sweep().join() # note that sweeping also does warming up
+    rp.maintain().join()
 
     assert rp.free == 2 and rp.busy == 2
 
@@ -1867,6 +1345,24 @@ if __name__ == "__main__":
 
         sleep(3.0)
         assert warm_pool.free == 3 and warm_pool.busy == 0
+
+    finally:
+        RegisteredResourcePool.stop_pools()
+
+    # see what happens if the resource fails to be created
+
+    RegisteredResourcePool.start_pools(3.0)
+    try:
+
+        sleep(1.5)
+        warm_pool = RegisteredResourcePool("DeadWarmPool", lambda name: 1 / 0, 2, 2)
+        assert warm_pool.free == 0 and warm_pool.busy == 0
+
+        sleep(3.0)
+        assert warm_pool.free == 0 and warm_pool.busy == 0
+
+        sleep(3.0)
+        assert warm_pool.free == 0 and warm_pool.busy == 0
 
     finally:
         RegisteredResourcePool.stop_pools()

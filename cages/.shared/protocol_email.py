@@ -17,6 +17,9 @@
 # ssl_key_cert_file = None,                           # ssl, optional filename
 # ssl_ca_cert_file = None,                            # ssl, optional filename
 # ssl_ciphers = None,                                 # ssl, optional str
+# ssl_protocol = None,                                # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+# ssl_server_hostname = None,                         # ssl, optional str
+# ssl_ignore_hostname = False,                        # ssl, ignore certificate common/alt name name mismatch
 # interval = 30.0,                                    # email
 # username = "user",                                  # email
 # password = "pass",                                  # email
@@ -39,8 +42,12 @@
 # ssl_key_cert_file = None,                           # ssl, optional filename
 # ssl_ca_cert_file = None,                            # ssl, optional filename
 # ssl_ciphers = None,                                 # ssl, optional str
+# ssl_protocol = None,                                # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+# ssl_server_hostname = None,                         # ssl, optional str
+# ssl_ignore_hostname = False,                        # ssl, ignore certificate common/alt name name mismatch
 # encoding = "windows-1251",                          # email
 # helo = "hostname",                                  # email
+# auth_method = None,                                 # email, optional "PLAIN" or "LOGIN"
 # username = None,                                    # email, optional
 # password = None,                                    # email, optional
 # )
@@ -73,7 +80,7 @@
 # as cid:{filename} which is replaced with a proper unique Content-ID.
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -100,7 +107,7 @@ if __name__ == "__main__": # add pythomnic/lib to sys.path
     sys.path.insert(0, os.path.normpath(os.path.join(main_module_dir, "..", "..", "lib")))
 
 import exc_string; from exc_string import exc_string
-import typecheck; from typecheck import typecheck, typecheck_with_exceptions, \
+import typecheck; from typecheck import typecheck, typecheck_with_exceptions, one_of, \
                                         optional, tuple_of, dict_of, by_regex, either
 import pmnc.threads; from pmnc.threads import HeavyThread
 import pmnc.request; from pmnc.request import fake_request
@@ -144,6 +151,9 @@ def _encode_auth_plain(username, password): # returns SMTP login token for AUTH 
     return b64encode(b"\x00" + username.encode("ascii") +
                      b"\x00" + password.encode("ascii")).decode("ascii")
 
+def _encode_auth_login(s): # returns BASE64 encoded token for AUTH LOGIN
+    return b64encode(s.encode("ascii")).decode("ascii")
+
 ###############################################################################
 
 class Interface: # email (POP3) interface
@@ -155,6 +165,9 @@ class Interface: # email (POP3) interface
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
+                 ssl_server_hostname: optional(str) = None,
+                 ssl_ignore_hostname: optional(bool) = False,
                  username: str,
                  password: str,
                  interval: float,
@@ -168,6 +181,9 @@ class Interface: # email (POP3) interface
         self._ssl_key_cert_file = ssl_key_cert_file
         self._ssl_ca_cert_file = ssl_ca_cert_file
         self._ssl_ciphers = ssl_ciphers
+        self._ssl_protocol = ssl_protocol
+        self._ssl_server_hostname = ssl_server_hostname
+        self._ssl_ignore_hostname = ssl_ignore_hostname
         self._username = username
         self._password = password
         self._interval = interval
@@ -226,7 +242,10 @@ class Interface: # email (POP3) interface
                                                            connect_timeout = self._connect_timeout,
                                                            ssl_key_cert_file = self._ssl_key_cert_file,
                                                            ssl_ca_cert_file = self._ssl_ca_cert_file,
-                                                           ssl_ciphers = self._ssl_ciphers)
+                                                           ssl_ciphers = self._ssl_ciphers,
+                                                           ssl_protocol = self._ssl_protocol,
+                                                           ssl_server_hostname = self._ssl_server_hostname,
+                                                           ssl_ignore_hostname = self._ssl_ignore_hostname)
                 self._pop3.connect()
                 try:
 
@@ -622,8 +641,12 @@ class Resource(TransactionalResource): # email (SMTP) resource
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
+                 ssl_server_hostname: optional(str) = None,
+                 ssl_ignore_hostname: optional(bool) = False,
                  encoding: str,
                  helo: str,
+                 auth_method: optional(one_of("PLAIN", "LOGIN")) = "PLAIN",
                  username: optional(str),
                  password: optional(str)):
 
@@ -631,6 +654,7 @@ class Resource(TransactionalResource): # email (SMTP) resource
 
         self._encoding = encoding
         self._helo = helo
+        self._auth_method = auth_method if (username is not None and password is not None) else None
         self._username = username
         self._password = password
 
@@ -640,7 +664,10 @@ class Resource(TransactionalResource): # email (SMTP) resource
                                           connect_timeout = connect_timeout,
                                           ssl_key_cert_file = ssl_key_cert_file,
                                           ssl_ca_cert_file = ssl_ca_cert_file,
-                                          ssl_ciphers = ssl_ciphers)
+                                          ssl_ciphers = ssl_ciphers,
+                                          ssl_protocol = ssl_protocol,
+                                          ssl_server_hostname = ssl_server_hostname,
+                                          ssl_ignore_hostname = ssl_ignore_hostname)
 
     ###################################
 
@@ -649,9 +676,15 @@ class Resource(TransactionalResource): # email (SMTP) resource
         self._smtp.connect()
         self._send_line(None, { 220 })
         self._send_line("HELO {0:s}".format(self._helo), { 250 })
-        if self._username and self._password:
+        if self._auth_method == "PLAIN":
             auth_plain = _encode_auth_plain(self._username, self._password)
             self._send_line("AUTH PLAIN {0:s}".format(auth_plain), { 235 })
+        elif self._auth_method == "LOGIN":
+            self._send_line("AUTH LOGIN", { 334 })
+            auth_username = _encode_auth_login(self._username)
+            self._send_line(auth_username, { 334 })
+            auth_password = _encode_auth_login(self._password)
+            self._send_line(auth_password, { 235 })
         self._graceful_close = True
 
     ###################################
@@ -803,7 +836,10 @@ def self_test():
     ssl_key_cert_file = None,
     ssl_ca_cert_file = None,
     ssl_ciphers = None,
-    username = "to",   # recipient's POP3 username
+    ssl_protocol = None,
+    ssl_server_hostname = None,
+    ssl_ignore_hostname = False,
+    username = "to", # recipient's POP3 username
     password = "pass", # recipient's POP3 password
     interval = 3.0,
     )

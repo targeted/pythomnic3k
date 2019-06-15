@@ -15,11 +15,13 @@
 # ssl_key_cert_file = None,                                  # ssl, optional filename
 # ssl_ca_cert_file = None,                                   # ssl, optional filename
 # ssl_ciphers = None,                                        # ssl, optional str
+# ssl_protocol = None,                                       # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
 # response_encoding = "windows-1251",                        # http
 # original_ip_header_fields = ("X-Forwarded-For", ),         # http
 # keep_alive_support = True,                                 # http
 # keep_alive_idle_timeout = 120.0,                           # http
 # keep_alive_max_requests = 10,                              # http
+# allow_none = False,                                        # xmlrpc, Python-specific, optional
 # )
 #
 # Sample processing module (interface_xmlrpc_1.py):
@@ -40,10 +42,14 @@
 # ssl_key_cert_file = None,                                  # ssl, optional filename
 # ssl_ca_cert_file = None,                                   # ssl, optional filename
 # ssl_ciphers = None,                                        # ssl, optional str
+# ssl_protocol = None,                                       # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+# ssl_server_hostname = None,                                # ssl, optional str
+# ssl_ignore_hostname = False,                               # ssl, ignore certificate common/alt name name mismatch
 # extra_headers = { "Authorization": "Basic dXNlcjpwYXNz" }, # http
 # http_version = "HTTP/1.1",                                 # http
 # server_uri = "/xmlrpc",                                    # xmlrpc
 # request_encoding = "windows-1251",                         # xmlrpc
+# allow_none = False,                                        # xmlrpc, Python-specific, optional
 # )
 #
 # Sample resource usage (anywhere):
@@ -57,7 +63,7 @@
 # result = pmnc.transaction.xmlrpc_1.Module.Method(*args)
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -75,7 +81,7 @@ if __name__ == "__main__": # add pythomnic/lib to sys.path
     sys.path.insert(0, os.path.normpath(os.path.join(main_module_dir, "..", "..", "lib")))
 
 import typecheck; from typecheck import typecheck, typecheck_with_exceptions, \
-                                        optional, tuple_of, dict_of, callable
+                                        optional, tuple_of, dict_of, callable, one_of
 import exc_string; from exc_string import exc_string
 import pmnc.resource_pool; from pmnc.resource_pool import TransactionalResource, ResourceError
 
@@ -90,12 +96,14 @@ class Interface: # XMLRPC interface built on top of HTTP interface
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
                  response_encoding: str,
                  original_ip_header_fields: tuple_of(str),
                  keep_alive_support: bool,
                  keep_alive_idle_timeout: float,
                  keep_alive_max_requests: int,
                  request_timeout: optional(float) = None,
+                 allow_none: optional(bool) = False,
                  **kwargs): # this kwargs allows for extra application-specific
                             # settings in config_interface_xmlrpc_X.py
 
@@ -111,6 +119,7 @@ class Interface: # XMLRPC interface built on top of HTTP interface
                                          ssl_key_cert_file = ssl_key_cert_file,
                                          ssl_ca_cert_file = ssl_ca_cert_file,
                                          ssl_ciphers = ssl_ciphers,
+                                         ssl_protocol = ssl_protocol,
                                          response_encoding = response_encoding,
                                          original_ip_header_fields = original_ip_header_fields,
                                          allowed_methods = ("POST", ),
@@ -131,7 +140,8 @@ class Interface: # XMLRPC interface built on top of HTTP interface
             lambda http_request, http_response: \
                 pmnc.__getattr__(__name__).process_http_request(http_request, http_response,
                                                                 self.process_xmlrpc_request,
-                                                                response_encoding = response_encoding)
+                                                                response_encoding = response_encoding,
+                                                                allow_none = allow_none or False)
 
     name = property(lambda self: self._http_interface.name)
     listener_address = property(lambda self: self._http_interface.listener_address)
@@ -157,7 +167,7 @@ class Interface: # XMLRPC interface built on top of HTTP interface
 
 def process_http_request(http_request: dict, http_response: dict,
                          process_xmlrpc_request: callable, *,
-                         response_encoding: str):
+                         response_encoding: str, allow_none: bool):
 
     assert http_request["method"] == "POST"
     headers = http_request["headers"]
@@ -206,11 +216,13 @@ def process_http_request(http_request: dict, http_response: dict,
 
         # marshal the result in an XMLRPC packet
 
-        content = dumps((result, ), methodresponse = True, encoding = response_encoding)
+        content = dumps((result, ), methodresponse = True,
+            encoding = response_encoding, allow_none = allow_none)
 
     except:
         error = exc_string()
-        content = dumps(Fault(500, error), methodresponse = True, encoding = response_encoding) # 500 as in "Internal Server Error"
+        content = dumps(Fault(500, error), methodresponse = True, # 500 as in "Internal Server Error"
+            encoding = response_encoding, allow_none = allow_none)
         pmnc.log.error("returning XMLRPC fault: {0:s}".format(error))
     else:
         if pmnc.log.debug:
@@ -230,15 +242,20 @@ class Resource(TransactionalResource): # XMLRPC resource
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
+                 ssl_server_hostname: optional(str) = None,
+                 ssl_ignore_hostname: optional(bool) = False,
                  extra_headers: dict_of(str, str),
                  http_version: str,
                  server_uri: str,
-                 request_encoding: str):
+                 request_encoding: str,
+                 allow_none: optional(bool) = False):
 
         TransactionalResource.__init__(self, name)
 
         self._server_uri = server_uri
         self._request_encoding = request_encoding
+        self._allow_none = allow_none
 
         self._http_resource = \
             pmnc.protocol_http.Resource(name,
@@ -247,6 +264,9 @@ class Resource(TransactionalResource): # XMLRPC resource
                                         ssl_key_cert_file = ssl_key_cert_file,
                                         ssl_ca_cert_file = ssl_ca_cert_file,
                                         ssl_ciphers = ssl_ciphers,
+                                        ssl_protocol = ssl_protocol,
+                                        ssl_server_hostname = ssl_server_hostname,
+                                        ssl_ignore_hostname = ssl_ignore_hostname,
                                         extra_headers = extra_headers,
                                         http_version = http_version)
 
@@ -296,7 +316,8 @@ class Resource(TransactionalResource): # XMLRPC resource
 
         try:
             method, self._attrs = ".".join(self._attrs), []
-            request = dumps(args, methodname = method, encoding = self._request_encoding)
+            request = dumps(args, methodname = method,
+                encoding = self._request_encoding, allow_none = self._allow_none)
             request_description = "XMLRPC request {0:s} to {1:s}".\
                                   format(method, self._http_resource.server_info)
         except:
@@ -379,11 +400,13 @@ def self_test():
     ssl_key_cert_file = None,
     ssl_ca_cert_file = None,
     ssl_ciphers = None,
+    ssl_protocol = None,
     response_encoding = "windows-1251",
     original_ip_header_fields = ("X-Forwarded-For", ),
     keep_alive_support = True,
     keep_alive_idle_timeout = 3.0,
     keep_alive_max_requests = 3,
+    allow_none = True
     )
 
     def interface_config(**kwargs):
@@ -469,8 +492,9 @@ def self_test():
 
             for i in range(16):
                 s = "*" * 2 ** i
-                result = pmnc.transaction.xmlrpc_1.Module.Method(i, s, [ s ], { s: i })
-                assert result == [ { "method": "Module.Method", "args": [ i, s, [ s ], { s: i } ] },
+                n = "n" + str(i)
+                result = pmnc.transaction.xmlrpc_1.Module.Method(i, s, [ s ], { s: i, n: None })
+                assert result == [ { "method": "Module.Method", "args": [ i, s, [ s ], { s: i, n: None } ] },
                                    { "username": "user", "peer_ip": "127.0.0.1", "password": "pass", "encrypted": False } ]
 
             try:

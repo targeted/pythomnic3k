@@ -14,7 +14,7 @@
 # Both interface and resource support SSL as well as plain TCP.
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -29,11 +29,11 @@ import socket; from socket import socket, AF_INET, SOCK_STREAM, SOCK_DGRAM, \
                                   SOL_SOCKET, SO_REUSEADDR, error as socket_error
 import io; from io import BytesIO
 import os; from os import SEEK_CUR, path as os_path
-import ssl; from ssl import wrap_socket, PROTOCOL_SSLv23, CERT_OPTIONAL, CERT_REQUIRED, \
-                            CERT_NONE, SSLError, SSL_ERROR_WANT_WRITE, SSL_ERROR_WANT_READ
+import ssl; from ssl import wrap_socket, CERT_OPTIONAL, CERT_REQUIRED, CERT_NONE, \
+                            SSLError, SSL_ERROR_WANT_WRITE, SSL_ERROR_WANT_READ, \
+                            SSLContext, PROTOCOL_SSLv23, OP_NO_SSLv2, OP_NO_SSLv3
 import random; from random import shuffle
 import sys; from sys import version_info
-wrap_socket_has_ciphers = version_info[:2] >= (3, 2)
 
 if __name__ == "__main__": # add pythomnic/lib to sys.path
     import os; import sys
@@ -234,18 +234,41 @@ class TcpConnection:
         try:
             self._socket.close()
         except:
-            pmnc.log.error(exc_string()) # log and ignore
+            if pmnc.log.debug:
+                pmnc.log.debug(exc_string()) # log and ignore
 
 ###############################################################################
 
-def _wrap_socket(s, *, ciphers, **kwargs):
+def _wrap_socket(s, *, ssl_ciphers, ssl_protocol, ssl_server_hostname, ssl_ignore_hostname, **kwargs):
 
-    if wrap_socket_has_ciphers:
-        return wrap_socket(s, ciphers = ciphers, **kwargs)
-    else:
-        if ciphers is not None:
-            pmnc.log.warning("SSL ciphers can only be configured in Python 3.2 and higher")
-        return wrap_socket(s, **kwargs)
+    ssl_protocol = ssl_protocol or "TLSv1"
+    try:
+        ssl_version = getattr(ssl, "PROTOCOL_{0:s}".format(ssl_protocol))
+    except AttributeError:
+        raise Exception("the requested SSL/TLS protocol {0:s} "
+                        "is not supported".format(ssl_protocol))
+
+    ssl_context = SSLContext(ssl_version)
+    if ssl_version == PROTOCOL_SSLv23:
+        ssl_context.options |= OP_NO_SSLv2
+        ssl_context.options |= OP_NO_SSLv3
+    if ssl_ciphers is not None:
+        ssl_context.set_ciphers(ssl_ciphers)
+
+    keyfile = kwargs.pop("keyfile", None)
+    certfile = kwargs.pop("certfile", None)
+    assert keyfile == certfile
+    if certfile:
+        ssl_context.load_cert_chain(certfile)
+    ca_certs = kwargs.pop("ca_certs")
+    ssl_context.load_verify_locations(ca_certs)
+    ssl_context.verify_mode = kwargs.pop("cert_reqs")
+    ssl_context.check_hostname = ssl_server_hostname is not None and not ssl_ignore_hostname
+
+    return ssl_context.wrap_socket(s,
+                do_handshake_on_connect = False,
+                server_hostname = ssl_server_hostname,
+                **kwargs)
 
 ###############################################################################
 
@@ -257,18 +280,25 @@ class SslConnection(TcpConnection):
     """
 
     @typecheck
-    def __init__(self, interface_name: str, socket, handler_factory: callable, request_timeout: float,
-                 ssl_key_cert_file: os_path.isfile, ssl_ca_cert_file: os_path.isfile, ssl_ciphers: optional(str),
+    def __init__(self,
+                 interface_name: str,
+                 socket,
+                 handler_factory: callable,
+                 request_timeout: float,
+                 ssl_key_cert_file: os_path.isfile,
+                 ssl_ca_cert_file: os_path.isfile,
+                 ssl_ciphers: optional(str),
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")),
                  required_auth_level: one_of(CERT_REQUIRED, CERT_OPTIONAL, CERT_NONE)):
 
         TcpConnection.__init__(self, interface_name, socket, handler_factory, request_timeout)
 
         self._tcp_socket = self._socket
-        self._socket = _wrap_socket(self._tcp_socket, server_side = True,
-                                    ssl_version = PROTOCOL_SSLv23, cert_reqs = required_auth_level,
-                                    keyfile = ssl_key_cert_file, certfile = ssl_key_cert_file,
-                                    ca_certs = ssl_ca_cert_file, ciphers = ssl_ciphers,
-                                    do_handshake_on_connect = False)
+        self._socket = _wrap_socket(self._tcp_socket, server_side = True, keyfile = ssl_key_cert_file,
+                                    certfile = ssl_key_cert_file, ca_certs = ssl_ca_cert_file,
+                                    ssl_ciphers = ssl_ciphers, ssl_protocol = ssl_protocol,
+                                    ssl_server_hostname = None, ssl_ignore_hostname = True,
+                                    cert_reqs = required_auth_level)
         self._socket.setblocking(False)
 
     def _state_initialize(self):                 # this fake state performs the initial
@@ -279,12 +309,12 @@ class SslConnection(TcpConnection):
         self._socket.do_handshake()
         self._peer_cn = _peer_cn(self._socket)   # this can be None if peer provided no certificate
         if pmnc.log.debug:
+            cipher = self._socket.cipher()
             if self._peer_cn:
                 pmnc.log.debug("{0:s} is encrypted ({1:s}) and authenticated ({2:s})".\
-                               format(self._cf, self._socket.cipher()[0], self._peer_cn))
+                               format(self._cf, cipher[0], self._peer_cn))
             else:
-                pmnc.log.debug("{0:s} is encrypted ({1:s})".\
-                               format(self._cf, self._socket.cipher()[0]))
+                pmnc.log.debug("{0:s} is encrypted ({1:s})".format(self._cf, cipher[0]))
         self._state = self._state_read
         return "read"
 
@@ -372,7 +402,8 @@ class TcpInterface: # called such so as not to be confused with "real" Interface
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
                  ssl_ciphers: optional(str),
-                 required_auth_level: optional(one_of(CERT_REQUIRED, CERT_OPTIONAL, CERT_NONE)) = CERT_OPTIONAL):
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")),
+                 required_auth_level: optional(one_of(CERT_REQUIRED, CERT_OPTIONAL, CERT_NONE)) = CERT_OPTIONAL): # this parameter is only user in protocol_rpc.py
 
         self._name = name
         self._handler_factory = handler_factory
@@ -386,6 +417,7 @@ class TcpInterface: # called such so as not to be confused with "real" Interface
         self._ssl_key_cert_file = ssl_key_cert_file
         self._ssl_ca_cert_file = ssl_ca_cert_file
         self._ssl_ciphers = ssl_ciphers
+        self._ssl_protocol = ssl_protocol
         self._use_ssl = ssl_key_cert_file is not None and ssl_ca_cert_file is not None
 
         # create two sides of a UDP socket used for kicking
@@ -409,7 +441,7 @@ class TcpInterface: # called such so as not to be confused with "real" Interface
             self._connection_factory = \
                 lambda socket: SslConnection(self._name, socket, self._handler_factory, request_timeout,
                                              self._ssl_key_cert_file, self._ssl_ca_cert_file,
-                                             self._ssl_ciphers, required_auth_level)
+                                             self._ssl_ciphers, self._ssl_protocol, required_auth_level)
         else:
             self._connection_factory = \
                 lambda socket: TcpConnection(self._name, socket, self._handler_factory, request_timeout)
@@ -535,7 +567,8 @@ class TcpInterface: # called such so as not to be confused with "real" Interface
                     if pmnc.log.debug:
                         pmnc.log.debug("gracefully closing {0:s}: {1:s}".format(_cf(socket), reason))
                 else:
-                    pmnc.log.error("discarding {0:s}: {1:s}".format(_cf(socket), reason))
+                    if pmnc.log.debug:
+                        pmnc.log.debug("discarding {0:s}: {1:s}".format(_cf(socket), reason))
             else:
                 if pmnc.log.debug:
                     pmnc.log.debug("gracefully closing {0:s}".format(_cf(socket)))
@@ -543,11 +576,13 @@ class TcpInterface: # called such so as not to be confused with "real" Interface
                 try:
                     connection.close(reason)
                 except:
-                    pmnc.log.error(exc_string()) # log and ignore
+                    if pmnc.log.debug:
+                        pmnc.log.debug(exc_string()) # log and ignore
             try:
                 socket.close()
             except:
-                pmnc.log.error(exc_string()) # log and ignore
+                if pmnc.log.debug:
+                    pmnc.log.debug(exc_string()) # log and ignore
 
         # this function is called periodically and forcefully discards the sockets
         # whose connections have expired, having this 3 seconds slack also helps in
@@ -829,12 +864,17 @@ class TcpResource: # called such so as not to be confused with "real" Resource's
     """
 
     @typecheck
-    def __init__(self, name: str, *,
+    def __init__(self,
+                 name: str,
+                 *,
                  server_address: (str, int),
                  connect_timeout: float,
                  ssl_key_cert_file: optional(os_path.isfile),
                  ssl_ca_cert_file: optional(os_path.isfile),
-                 ssl_ciphers: optional(str)):
+                 ssl_ciphers: optional(str),
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")),
+                 ssl_server_hostname: optional(str),
+                 ssl_ignore_hostname: optional(bool)):
 
         self._name = name
         self._server_address = server_address
@@ -846,6 +886,9 @@ class TcpResource: # called such so as not to be confused with "real" Resource's
         self._ssl_key_cert_file = ssl_key_cert_file
         self._ssl_ca_cert_file = ssl_ca_cert_file
         self._ssl_ciphers = ssl_ciphers
+        self._ssl_protocol = ssl_protocol
+        self._ssl_server_hostname = ssl_server_hostname
+        self._ssl_ignore_hostname = ssl_ignore_hostname
 
         self._use_ssl = ssl_ca_cert_file is not None
         self._peer_cn = None
@@ -903,8 +946,15 @@ class TcpResource: # called such so as not to be confused with "real" Resource's
 
     def connect(self):
 
+        if self._ssl_server_hostname is not None:
+            ssl_server_hostname = self._ssl_server_hostname
+            sni_suffix = "/sni={0:s}".format(ssl_server_hostname)
+        else:
+            ssl_server_hostname = self._server_address[0]
+            sni_suffix = ""
+
         if pmnc.log.debug:
-            pmnc.log.debug("connecting to {0:s}".format(self._server_info))
+            pmnc.log.debug("connecting to {0:s}{1:s}".format(self._server_info, sni_suffix))
         try:
 
             self._socket = socket(AF_INET, SOCK_STREAM)
@@ -924,10 +974,16 @@ class TcpResource: # called such so as not to be confused with "real" Resource's
                     self._socket.getpeername() # fixme - remove, see http://bugs.python.org/issue4171
 
                     self._tcp_socket = self._socket
-                    self._socket = _wrap_socket(self._tcp_socket, server_side = False, ssl_version = PROTOCOL_SSLv23,
-                                                keyfile = self._ssl_key_cert_file, certfile = self._ssl_key_cert_file,
-                                                ca_certs = self._ssl_ca_cert_file, ciphers = self._ssl_ciphers,
-                                                cert_reqs = CERT_REQUIRED, do_handshake_on_connect = False)
+                    self._socket = _wrap_socket(self._tcp_socket,
+                                                server_side = False,
+                                                keyfile = self._ssl_key_cert_file,
+                                                certfile = self._ssl_key_cert_file,
+                                                ca_certs = self._ssl_ca_cert_file,
+                                                ssl_ciphers = self._ssl_ciphers,
+                                                ssl_protocol = self._ssl_protocol,
+                                                ssl_server_hostname = ssl_server_hostname,
+                                                ssl_ignore_hostname = self._ssl_ignore_hostname,
+                                                cert_reqs = CERT_REQUIRED)
                     self._socket.setblocking(False)
 
                     # perform asynchronous handshake within the rest of connect_timeout
@@ -955,8 +1011,8 @@ class TcpResource: # called such so as not to be confused with "real" Resource's
                 raise
 
         except:
-            pmnc.log.error("connection to {0:s} failed: {1:s}".\
-                           format(self._server_info, exc_string()))
+            pmnc.log.error("connection to {0:s}{1:s} failed: {2:s}".\
+                           format(self._server_info, sni_suffix, exc_string()))
             raise
         else:
             if pmnc.log.debug:
@@ -1035,7 +1091,7 @@ def self_test():
 
     ###################################
 
-    def test_interface(ssl_key_cert_file, ssl_ca_cert_file, ssl_ciphers):
+    def test_interface(ssl_key_cert_file, ssl_ca_cert_file, ssl_ciphers, ssl_protocol):
 
         ###############################
 
@@ -1045,6 +1101,7 @@ def self_test():
             kwargs.setdefault("ssl_key_cert_file", ssl_key_cert_file)
             kwargs.setdefault("ssl_ca_cert_file", ssl_ca_cert_file)
             kwargs.setdefault("ssl_ciphers", ssl_ciphers)
+            kwargs.setdefault("ssl_protocol", ssl_protocol)
             ifc = TcpInterface("test", handler_factory, request_timeout, **kwargs)
             ifc.start()
             return ifc
@@ -1055,9 +1112,12 @@ def self_test():
             s = socket(AF_INET, SOCK_STREAM)
             s.connect(ifc.listener_address)
             if ssl_key_cert_file:
-                s = _wrap_socket(s, cert_reqs = CERT_REQUIRED, ssl_version = PROTOCOL_SSLv23,
-                                 ca_certs = ssl_ca_cert_file, ciphers = ssl_ciphers,
-                                 do_handshake_on_connect = False)
+                s = _wrap_socket(s, ca_certs = ssl_ca_cert_file,
+                                 ssl_protocol = ssl_protocol,
+                                 ssl_ciphers = ssl_ciphers,
+                                 ssl_server_hostname = None,
+                                 ssl_ignore_hostname = True,
+                                 cert_reqs = CERT_REQUIRED)
                 try:
                     s.do_handshake()
                 except:
@@ -1211,13 +1271,14 @@ def self_test():
 
                 fake_request(10.0)
 
-                # connection failure
-
-                r = pmnc.protocol_tcp.TcpResource("tres1", server_address = ("1.2.3.4", 1234),
+                r = pmnc.protocol_tcp.TcpResource("tres", server_address = ("1.2.3.4", 1234),
                                                   connect_timeout = 3.0,
                                                   ssl_key_cert_file = ifc._ssl_key_cert_file,
                                                   ssl_ca_cert_file = ifc._ssl_ca_cert_file,
-                                                  ssl_ciphers = ifc._ssl_ciphers)
+                                                  ssl_ciphers = ifc._ssl_ciphers,
+                                                  ssl_protocol = ifc._ssl_protocol,
+                                                  ssl_server_hostname = None,
+                                                  ssl_ignore_hostname = True)
                 try:
                     r.connect()
                 except:
@@ -1271,10 +1332,14 @@ def self_test():
 
                 fake_request(10.0)
 
-                r = pmnc.protocol_tcp.TcpResource("tres2", server_address = ifc.listener_address,
-                                                  connect_timeout = 3.0, ssl_key_cert_file = None,
+                r = pmnc.protocol_tcp.TcpResource("tres", server_address = ifc.listener_address,
+                                                  connect_timeout = 3.0,
+                                                  ssl_key_cert_file = None,
                                                   ssl_ca_cert_file = ifc._ssl_ca_cert_file,
-                                                  ssl_ciphers = ifc._ssl_ciphers)
+                                                  ssl_ciphers = ifc._ssl_ciphers,
+                                                  ssl_protocol = ifc._ssl_protocol,
+                                                  ssl_server_hostname = None,
+                                                  ssl_ignore_hostname = True)
                 test_res(ifc, r)
 
             finally:
@@ -1293,22 +1358,29 @@ def self_test():
                 fake_request(10.0)
 
                 if ifc.encrypted:
-                    r = pmnc.protocol_tcp.TcpResource("tres2", server_address = ifc.listener_address,
-                                                      connect_timeout = 3.0, ssl_key_cert_file = None,
+                    r = pmnc.protocol_tcp.TcpResource("tres", server_address = ifc.listener_address,
+                                                      connect_timeout = 3.0,
+                                                      ssl_key_cert_file = None,
                                                       ssl_ca_cert_file = ifc._ssl_ca_cert_file,
-                                                      ssl_ciphers = ifc._ssl_ciphers)
+                                                      ssl_ciphers = ifc._ssl_ciphers,
+                                                      ssl_protocol = ifc._ssl_protocol,
+                                                      ssl_server_hostname = None,
+                                                      ssl_ignore_hostname = True)
                     try:
                         r.connect()
-                    except:
-                        pass
+                    except Exception as e:
+                        assert "HANDSHAKE_FAILURE" in str(e)
                     else:
                         assert False, "shouldn't be able to connect without a client certificate"
 
-                r = pmnc.protocol_tcp.TcpResource("tres2", server_address = ifc.listener_address,
+                r = pmnc.protocol_tcp.TcpResource("tres", server_address = ifc.listener_address,
                                                   connect_timeout = 3.0,
                                                   ssl_key_cert_file = ifc._ssl_key_cert_file,
                                                   ssl_ca_cert_file = ifc._ssl_ca_cert_file,
-                                                  ssl_ciphers = ifc._ssl_ciphers)
+                                                  ssl_ciphers = ifc._ssl_ciphers,
+                                                  ssl_protocol = ifc._ssl_protocol,
+                                                  ssl_server_hostname = None,
+                                                  ssl_ignore_hostname = True)
 
                 test_res(ifc, r)
 
@@ -1316,6 +1388,133 @@ def self_test():
                 ifc.cease(); ifc.stop()
 
         test_loopback_2way()
+
+        ###############################
+
+        pmnc.log.message("****************** LOOPBACK INCOMPATIBLE PROTOCOLS ******************")
+
+        def test_loopback_protocols():
+            ifc = start_interface(LineEchoParser, ssl_protocol = "TLSv1_1")
+            try:
+
+                fake_request(10.0)
+
+                s = socket(AF_INET, SOCK_STREAM)
+                s.connect(ifc.listener_address)
+                s = _wrap_socket(s, ca_certs = ifc._ssl_ca_cert_file,
+                                 ssl_ciphers = ssl_ciphers,
+                                 ssl_protocol = "TLSv1_2",
+                                 ssl_server_hostname = None,
+                                 ssl_ignore_hostname = True,
+                                 cert_reqs = CERT_OPTIONAL)
+                try:
+                    s.do_handshake()
+                except Exception as e:
+                    assert "VERSION" in str(e)
+                else:
+                    assert False, "shouldn't be able to connect over incompatible protocol"
+                s.close()
+
+                s = socket(AF_INET, SOCK_STREAM)
+                s.connect(ifc.listener_address)
+                s = _wrap_socket(s, ca_certs = ifc._ssl_ca_cert_file,
+                                 ssl_ciphers = ssl_ciphers,
+                                 ssl_protocol = "TLSv1_1",
+                                 ssl_server_hostname = None,
+                                 ssl_ignore_hostname = True,
+                                 cert_reqs = CERT_OPTIONAL)
+                s.do_handshake()
+                s.close()
+
+            finally:
+                ifc.cease(); ifc.stop()
+
+        if ssl_protocol:
+            test_loopback_protocols()
+
+        ###############################
+
+        pmnc.log.message("****************** SIMPLE HOSTNAME MISMATCH ******************")
+
+        def test_simple_hostname_mismatch():
+            ifc = start_interface(LineEchoParser)
+            try:
+
+                fake_request(10.0)
+
+                r = pmnc.protocol_tcp.TcpResource("tres", server_address = ("localhost", ifc.listener_address[1]),
+                                                  connect_timeout = 3.0,
+                                                  ssl_key_cert_file = ifc._ssl_key_cert_file,
+                                                  ssl_ca_cert_file = ifc._ssl_ca_cert_file,
+                                                  ssl_ciphers = ifc._ssl_ciphers,
+                                                  ssl_protocol = ifc._ssl_protocol,
+                                                  ssl_server_hostname = None,
+                                                  ssl_ignore_hostname = False)
+                try:
+                    r.connect()
+                except Exception as e:
+                    assert "match" in str(e) and "localhost" in str(e)
+                else:
+                    assert False, "shouldn't be able to connect"
+
+
+                r = pmnc.protocol_tcp.TcpResource("tres", server_address = ("localhost", ifc.listener_address[1]),
+                                                  connect_timeout = 3.0,
+                                                  ssl_key_cert_file = ifc._ssl_key_cert_file,
+                                                  ssl_ca_cert_file = ifc._ssl_ca_cert_file,
+                                                  ssl_ciphers = ifc._ssl_ciphers,
+                                                  ssl_protocol = ifc._ssl_protocol,
+                                                  ssl_server_hostname = None,
+                                                  ssl_ignore_hostname = True)
+                r.connect()
+                r.disconnect()
+
+            finally:
+                ifc.cease(); ifc.stop()
+
+        if ssl_protocol:
+            test_simple_hostname_mismatch()
+
+        ###############################
+
+        pmnc.log.message("****************** SNI HOSTNAME MISMATCH ******************")
+
+        def test_sni_hostname_mismatch():
+            ifc = start_interface(LineEchoParser, ssl_protocol = "TLSv1_1")
+            try:
+
+                s = socket(AF_INET, SOCK_STREAM)
+                s.connect(ifc.listener_address)
+                s = _wrap_socket(s, ca_certs = ifc._ssl_ca_cert_file,
+                                 ssl_ciphers = ssl_ciphers,
+                                 ssl_protocol = "TLSv1_1",
+                                 ssl_server_hostname = "foobar",
+                                 ssl_ignore_hostname = False,
+                                 cert_reqs = CERT_OPTIONAL)
+                try:
+                    s.do_handshake()
+                except Exception as e:
+                    assert "match" in str(e) and "foobar" in str(e)
+                else:
+                    assert False, "shouldn't be able to connect to a mismatched server"
+                s.close()
+
+                s = socket(AF_INET, SOCK_STREAM)
+                s.connect(ifc.listener_address)
+                s = _wrap_socket(s, ca_certs = ifc._ssl_ca_cert_file,
+                                 ssl_ciphers = ssl_ciphers,
+                                 ssl_protocol = "TLSv1_1",
+                                 ssl_server_hostname = "foobar",
+                                 ssl_ignore_hostname = True,
+                                 cert_reqs = CERT_OPTIONAL)
+                s.do_handshake()
+                s.close()
+
+            finally:
+                ifc.cease(); ifc.stop()
+
+        if ssl_protocol:
+            test_sni_hostname_mismatch()
 
         ###############################
 
@@ -1596,10 +1795,92 @@ def self_test():
 
     ###################################
 
-    test_interface(None, None, None) # tcp
-    test_interface(os_path.join(__cage_dir__, "ssl_keys", "key_cert.pem"),
-                   os_path.join(__cage_dir__, "ssl_keys", "ca_cert.pem"),
-                   wrap_socket_has_ciphers and "HIGH:!aNULL:!MD5" or None) # ssl
+    # TCP
+
+    test_interface(None, None, None, None)
+
+    ###################################
+
+    # SSL
+
+    test_ca_cert = """-----BEGIN CERTIFICATE-----
+MIIC9TCCAd2gAwIBAgIBADANBgkqhkiG9w0BAQsFADANMQswCQYDVQQDDAJDQTAe
+Fw0xOTAxMDEwMDAwMDBaFw0yODEyMzEyMzU5NTlaMA0xCzAJBgNVBAMMAkNBMIIB
+IjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxV903JyafnXPL/eVnAd/+eY3
+n6yVdqCiwjdq8ijt6+c8pTLb3JmvpkQnVQJ6rwFdF0p/qKa0ghvAkNehzwLSWqMj
+56ce6d5/gIsh6PQRZEkcPkVfKvC03IRwvB2ObfQyL7/fAmGWwfiKIBpy/O4qNxcP
+nMjCpfmYo3fLIqOZGSRE3BARk5GywcTjWPnVXWbkLdVorwOk5lm5zs98dQh8pu7Q
+9V2YA2RvIm/QkXLGDmQc3AdbwM6i1NdexlgwbCdfP3MvtxLqti60woQvhACiV210
+ddP7PU07VvxItnw/lYYKkZBybAjrfaNH5TwzjVD6tr18RZX9Hn4z8+dNz4kLqwID
+AQABo2AwXjAPBgNVHRMBAf8EBTADAQH/MAsGA1UdDwQEAwIBBjAdBgNVHQ4EFgQU
+daB4T0JlwTNT38CZsajeFw9KArUwHwYDVR0jBBgwFoAUdaB4T0JlwTNT38CZsaje
+Fw9KArUwDQYJKoZIhvcNAQELBQADggEBADGS7NZe3jHZZtJy2JPScx4R20nHygTW
+OKq5q2EYdlClPDj7JjRckJB8GSRcOdo/69tNn/28HxtCe6PKZklNQTKPP21msPu6
+Cz+Ey1dEuZlpPDX+3ntxl0cXv02iAolmHKk/9I0AQRrBnFmO7zcC1LjU0w2O9a0t
+ijO5kP3/7MM7+jqk/ff94vhSkxqAC8m4V9ypmxBFRKBA9FuiSDnx0KWqNCterpAt
+XgyXnpmIGPih3Qq1tS+i7wJGzMVP6YsIKPS0fqqc88LUBmMmibiBlw/oj51JsPeS
+scXlhdydmgVokDyHh9asuOi11G5SJdkwJEFChibg6xcmsIfWITgc0ig=
+-----END CERTIFICATE-----"""
+
+    test_ca_cert_pem = os_path.join(__cage_dir__, "ssl_keys", "test_ca_cert.pem")
+    with open(test_ca_cert_pem, "w") as f:
+        f.write(test_ca_cert)
+
+    test_key_cert = """-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDKGN8mIQsTwSnw
+oP+jF2wJnqx8iW/AbdNWeoPTfz3e9/bZkleuuIdSUiQk15IxCoaSAxhkDnM/Y2A9
+9CVGfC/XhJ0C3NZQGQK8HVih93X+/8y6HrHPVyUKTzzEBC0Jnipw7F7bwRRtBno3
+r+lji84b4b/I0cMudc/P04fZYivzKSrReS7dr/EhwlF3AAu0Cvyt0ictgZ+dr9rH
+mrfHjZLV0H++pNWsCX/Yf23qz0gMZq5HlTaOPteUsyzvS52/TtKignYQwKI20DU1
+AO1ltYrryGdOKWU3xEh20wDVkU794/CHTb8GIdtJ2HZ6VnbeCgXofOGB+1fAq1La
+cA/GYcopAgMBAAECggEARPxWd+qBoH2odlZOzPo6y9HZKS208ufKY1Ow2iouEYVt
+QvmcaqzcrHITmmvnoEvqgb8CvWzdVD705FEJxFSx9Ax1mDuQAIl5EIOn9KnHIoNo
+/ANsSM2DfFBt+q8+PHE8JY3aF4OCGHFEmOu4bF2VvpjB4agQyzQ1+shHMCI9xGOm
+mHarV1KE9V/fZ6OwSQ0+SuPn9kFvHFVHpyOoS+2Mk2cO7Uasvsx5VX0leQesGSOQ
+NVUk0Klyf4rdv8AqlqS7h97Ereh+4NhroV5Dmje6PVJb5VQWmKIDMXetslJnNn9x
+74/hBKzZzcJiInmCsf9eTNRPi1nCMBJEAF0o1qvzfQKBgQDvSekXVxU/rYbIylJc
+gZSBo1U3rNDLneoJp2WDJtYSU4krsDNU7gNFglt1RJy+50gs9UQVL7ulSy/t/cUh
+FrRmnR13H9FHagQcIs2vkKYGYCEsOeLBGWeC8+PRNFgE2K24rQjWoF5aX0lUApMt
+dLApNJ6ThfsVjtedlpVPRMcCHwKBgQDYNgmCKrQ7SnRmCn2CMXj+hiGtHiWvDROw
+dirAtgayJp8MsQ72sf6seSba/1QKXaowy65zENTvSUeWkeHqbP2uDdA8q6Stdo51
+Wl0FjFWI2+7l8ajt39oFeXjcDBqXpB9zywF8+NvE/1aSOb5mA6FJ0CNTrPVESmzR
+2tkf7FP6twKBgHmRFCFudXYfY315BDTJBDiEUVPysTTw6iizaagiv9kZpXOTldCN
+Bw52Np6yF+wItitZA5i74loMg7ImHdM8pLQJGCIgAQOGAcaFi/eoxiAxEElWszOl
+A2iNHW14aUs1BbTv+7CGUskY5bkPgdQzFxgoCnQqOjBunG4MRZi6+VvDAoGBAJp4
+6Qw1xHUD+euZnRgyjnaSkGbmPhg2KJYPpvXuVxRbIZFowv8gJotFN6yJdZq+VsTs
+EOQm52tamKoL6jOZ0RjUx61BGLPSG2/ess0u+UGBmMpygLYLE/KLWf0lLK6g1NPe
++141UpcJsulgFhc+irJ44XR8AvPalKrOSAhVyZ47AoGBANlNdybQ42Po+qwPKmnX
+CrydNcDpjxvjOMBFK6u62H31azy1Ywjq/E889stWhC/gfu59mryoiaL3OHUSGKA4
+vnq3uE6p9rrHemDbsbxu0ulB7nWjGYMO8CJ0eZQtJ2XhsAq6T+PLyjvtcTpF8Quj
+qAq7Vjx1b1l0NttiU7YtSe+2
+-----END PRIVATE KEY-----
+-----BEGIN CERTIFICATE-----
+MIIDQjCCAiqgAwIBAgIBBjANBgkqhkiG9w0BAQsFADANMQswCQYDVQQDDAJDQTAe
+Fw0xOTAxMDEwMDAwMDBaFw0yODEyMzEyMzU5NTlaMBQxEjAQBgNVBAMMCTEyNy4w
+LjAuMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMoY3yYhCxPBKfCg
+/6MXbAmerHyJb8Bt01Z6g9N/Pd739tmSV664h1JSJCTXkjEKhpIDGGQOcz9jYD30
+JUZ8L9eEnQLc1lAZArwdWKH3df7/zLoesc9XJQpPPMQELQmeKnDsXtvBFG0Gejev
+6WOLzhvhv8jRwy51z8/Th9liK/MpKtF5Lt2v8SHCUXcAC7QK/K3SJy2Bn52v2sea
+t8eNktXQf76k1awJf9h/berPSAxmrkeVNo4+15SzLO9Lnb9O0qKCdhDAojbQNTUA
+7WW1iuvIZ04pZTfESHbTANWRTv3j8IdNvwYh20nYdnpWdt4KBeh84YH7V8CrUtpw
+D8ZhyikCAwEAAaOBpTCBojAJBgNVHRMEAjAAMAsGA1UdDwQEAwIF4DA0BgNVHSUE
+LTArBggrBgEFBQcDAgYIKwYBBQUHAwEGCisGAQQBgjcKAwMGCWCGSAGG+EIEATAd
+BgNVHQ4EFgQUCkRwfnvsDzuyMwDIsY7WEGkB68EwHwYDVR0jBBgwFoAUdaB4T0Jl
+wTNT38CZsajeFw9KArUwEgYDVR0RAQH/BAgwBocEfwAAATANBgkqhkiG9w0BAQsF
+AAOCAQEAStqUhxrmawsLE/2zs3koYDDokUaf8Ys0J1UBhszZ7QwFURBQTkxBU5im
+avuQUHyzRuNjzMdS+UMqCwhBddiTNg9kFx+5eBpxJghheFXsQnMXsqtem7sbiEot
+ZnfqzPhwJOvCVUzeyBta3YWCKFuP/sETizXNZvxIsTW0AQCIk+t98k6E6HnBD7/l
+RpsGGA8wJJ9HCvJWY7vCWZi1kHTdtqvsG5a4MzGJag9gbKtuhIezXNRiHdNjbM4E
+EZxxmiyIKzWDjHRToGyreMLCtbZB6Mnt5pQH8yZYBpxx4Gsx+tMhwsOSZvYetuPd
+4srBSr1jxrFM2vyCz9iEUexA59IcMA==
+-----END CERTIFICATE-----
+"""
+
+    test_key_cert_pem = os_path.join(__cage_dir__, "ssl_keys", "test_key_cert.pem")
+    with open(test_key_cert_pem, "w") as f:
+        f.write(test_key_cert)
+
+    test_interface(test_key_cert_pem, test_ca_cert_pem, "HIGH:!aNULL:!MD5", "TLSv1")
 
     ###################################
 

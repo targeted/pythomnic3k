@@ -14,10 +14,14 @@ connect_timeout = 3.0,                        # tcp
 ssl_key_cert_file = None,                     # ssl, optional filename
 ssl_ca_cert_file = None,                      # ssl, optional filename
 ssl_ciphers = None,                           # ssl, optional str
+ssl_protocol = None,                          # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
+ssl_server_hostname = None,                   # ssl, optional str
+ssl_ignore_hostname = False,                  # ssl, ignore certificate common/alt name name mismatch
 extra_headers = {},                           # http
 http_version = "HTTP/1.1",                    # http
 server_uri = "/xmlrpc",                       # xmlrpc
 request_encoding = "windows-1251",            # xmlrpc
+allow_none = False,                           # xmlrpc, Python-specific, optional
 )
 
 # self-tests of protocol_xmlrpc.py depend on the following configuration,
@@ -27,6 +31,7 @@ self_test_config = dict \
 (
 server_address = ("127.0.0.1", 23673),
 extra_headers = { "Authorization": "Basic dXNlcjpwYXNz" },
+allow_none = True,
 )
 
 # DO NOT TOUCH BELOW THIS LINE

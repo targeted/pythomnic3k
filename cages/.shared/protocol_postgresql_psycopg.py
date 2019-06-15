@@ -34,7 +34,7 @@
 # insert_records, select_records = pmnc.transaction.postgresql_1.execute(...)
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2015, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -228,13 +228,16 @@ class Resource(SQLResource): # PostgreSQL resource
 
     ###################################
 
-    _supported_types = SQLResource._supported_types | { float, timedelta }
+    _supported_types = SQLResource._supported_types | { float, timedelta, list }
 
     def _py_to_sql_float(self, v):
         return v
 
     def _py_to_sql_timedelta(self, v):
         return v
+
+    def _py_to_sql_list(self, el):
+        return [ self._py_to_sql(v) for v in el ]
 
     ###################################
 
@@ -249,6 +252,15 @@ class Resource(SQLResource): # PostgreSQL resource
 
     def _sql_to_py_timedelta(self, v):
         return v
+
+    def _sql_to_py_list(self, el):
+        pel = []
+        same = True
+        for v in el:
+            pv = self._sql_to_py(v)
+            pel.append(pv)
+            same = same and pv is v
+        return el if same else pel
 
 ###############################################################################
 
@@ -586,7 +598,7 @@ def self_test():
 
         test_str()
 
-        # str
+        # bytes
 
         def test_bytes():
 
@@ -597,6 +609,20 @@ def self_test():
             assert test_value("bytea", r) == ([{'value': r}], [], [], [{'value': r}], [])
 
         test_bytes()
+
+        # list
+
+        def test_list():
+
+            assert test_value("int[]", None) == ([{'value': None}], [], [], [{'value': None}], [])
+            assert test_value("varchar[]", [ "foo" ]) == ([{'value': ['foo']}], [], [], [{'value': ['foo']}], [])
+
+            assert test_value("varchar[]", []) == ([{'value': []}], [], [], [{'value': []}], [])
+            assert test_value("varchar[]", [ "foo", 123 ]) == ([{'value': ['foo', '123']}], [], [], [{'value': ['foo', '123']}], [])
+
+            assert test_value("int[][]", [ [1, 2], [3, 4] ]) == ([{'value': [[1, 2], [3, 4]]}], [], [], [{'value': [[1, 2], [3, 4]]}], [])
+
+        test_list()
 
     test_supported_types()
 
