@@ -7,7 +7,7 @@
 # as necessary.
 #
 # Pythomnic3k project
-# (c) 2005-2014, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ################################################################################
@@ -258,7 +258,7 @@ if __name__ == "__main__":
         try:
             tp.enqueue(rq, wu_failed, (), {}).wait()
         except FooException as e:
-            assert exc_string().startswith("FooException(\"fails\") in wu_failed() (thread_pool.py:256)")
+            assert exc_string().startswith("FooException(\"fails\") in wu_failed() (thread_pool.py:")
         else:
             assert False
 
@@ -336,7 +336,7 @@ if __name__ == "__main__":
         try:
             wu.wait()
         except ZeroDivisionError:
-            assert "in wu_error() (thread_pool.py:331)" in exc_string() # note the original line
+            assert "in wu_error() (thread_pool.py:" in exc_string()
         else:
             assert False
 
