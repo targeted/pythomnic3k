@@ -839,8 +839,8 @@ def self_test():
     ssl_protocol = None,
     ssl_server_hostname = None,
     ssl_ignore_hostname = False,
-    username = "recipient@domain.com", # recipient's POP3 username
-    password = "password", # recipient's POP3 password
+    username = "to", # recipient's POP3 username
+    password = "pass", # recipient's POP3 password
     interval = 3.0,
     )
 
@@ -851,8 +851,8 @@ def self_test():
 
     ###################################
 
-    from_addr = "sender@domain.com" # sender's address
-    to_addr = "recipient@domain.com"   # recipient's address
+    from_addr = "from@domain.com" # sender's address
+    to_addr = "to@domain.com"     # recipient's address
 
     russian = "ÀÁÂÃÄÅ¨ÆÇÈÉÊËÌÍÎÏĞÑÒÓÔÕÖ×ØÙÜÛÚİŞßàáâãäå¸æçèéêëìíîïğñòóôõö÷øùüûúışÿ"
 

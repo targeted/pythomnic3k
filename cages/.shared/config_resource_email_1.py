@@ -30,6 +30,8 @@ password = None,                              # email, optional string
 self_test_config = dict \
 (
 server_address = ("mail.domain.com", 25),
+username = "from", # sender's SMTP username (if necessary)
+password = "pass", # sender's SMTP password (if necessary)
 )
 
 # DO NOT TOUCH BELOW THIS LINE
