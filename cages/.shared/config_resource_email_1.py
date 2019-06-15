@@ -29,10 +29,7 @@ password = None,                              # email, optional string
 
 self_test_config = dict \
 (
-server_address = ("mail.targeted.org", 25),
-helo = "fttx-pool-185.53.43.175.bambit.de",
-username = "test1@targeted.org", # sender's SMTP username (if necessary)
-password = "aaatest1", # sender's SMTP password (if necessary)
+server_address = ("mail.domain.com", 25),
 )
 
 # DO NOT TOUCH BELOW THIS LINE

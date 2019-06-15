@@ -831,7 +831,7 @@ def self_test():
     test_interface_config = dict \
     (
     protocol = "email",
-    server_address = ("mail.targeted.org", 110),
+    server_address = ("mail.domain.com", 110),
     connect_timeout = 3.0,
     ssl_key_cert_file = None,
     ssl_ca_cert_file = None,
@@ -839,8 +839,8 @@ def self_test():
     ssl_protocol = None,
     ssl_server_hostname = None,
     ssl_ignore_hostname = False,
-    username = "test2@targeted.org", # recipient's POP3 username
-    password = "aaatest2", # recipient's POP3 password
+    username = "recipient@domain.com", # recipient's POP3 username
+    password = "password", # recipient's POP3 password
     interval = 3.0,
     )
 
@@ -851,8 +851,8 @@ def self_test():
 
     ###################################
 
-    from_addr = "test1@targeted.org" # sender's address
-    to_addr = "test2@targeted.org"   # recipient's address
+    from_addr = "sender@domain.com" # sender's address
+    to_addr = "recipient@domain.com"   # recipient's address
 
     russian = "ÀÁÂÃÄÅ¨ÆÇÈÉÊËÌÍÎÏĞÑÒÓÔÕÖ×ØÙÜÛÚİŞßàáâãäå¸æçèéêëìíîïğñòóôõö÷øùüûúışÿ"
 
