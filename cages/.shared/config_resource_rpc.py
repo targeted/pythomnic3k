@@ -1,4 +1,4 @@
-# Configuration file for interface "rpc". This resoource is
+# Configuration file for interface "rpc". This resource is
 # used in conjunction with RPC interface for cage-to-cage RPC calls.
 #
 # If location discovery at runtime is used (which is recommended),
@@ -11,9 +11,10 @@
 # Alternatively, exact_locations is a cage name to cage location mapping,
 # for example
 #
-# exact_locations = { "other_cage": "ssl://1.2.3.4:5678/" }
+# exact_locations = { "foo": "ssl://1.2.3.4:5678/", ... } # name-to-url
+# exact_locations = { "bar": { "ssl://bar1.dns:5678/", "tcp://bar2.dns:5678/" }, ... } # name-to-set-of-urls
 #
-# in which case other_cage's config_interface_rpc.py will likely contain
+# in which case the other cage's config_interface_rpc.py must have a fixed RPC port configured:
 #
 # random_port = 5678, # fixed port number
 #
@@ -29,6 +30,8 @@ protocol = "rpc",                                       # meta
 broadcast_address = ("0.0.0.0/255.255.255.255", 12480), # rpc, "interface address/broadcast address", port
 discovery_timeout = 3.0,                                # rpc + tcp (connect timeout)
 multiple_timeout_allowance = 0.5,                       # rpc, in range 0.0..1.0
+ssl_ciphers = None,                                     # ssl, optional str
+ssl_protocol = None,                                    # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
 flock_id = "DEFAULT",                                   # rpc
 marshaling_methods = ("msgpack", "pickle"),             # rpc, marshaling methods, priority ordered
 max_packet_size = 1048576,                              # rpc, maximum allowed request/response size in bytes

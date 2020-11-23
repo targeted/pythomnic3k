@@ -60,6 +60,8 @@
 # random_port = -63000,                                    # tcp, negative means "in range 63000..63999"
 # max_connections = 100,                                   # tcp
 # broadcast_address = ("1.2.3.4/1.2.3.255", 12480),        # rpc, "interface address/broadcast address", port
+# ssl_ciphers = None,                                      # ssl, optional str
+# ssl_protocol = None,                                     # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
 # flock_id = "DEFAULT",                                    # rpc, arbitrary cage group identifier
 # marshaling_methods = ("msgpack", "pickle"),              # rpc, allowed marshaling methods
 # max_packet_size = 1048576,                               # rpc, maximum allowed request/response size in bytes
@@ -73,14 +75,17 @@
 # broadcast_address = ("1.2.3.4/1.2.3.255", 12480),        # rpc, "interface address/broadcast address", port
 # discovery_timeout = 3.0,                                 # rpc + tcp (discovery + connect timeout)
 # multiple_timeout_allowance = 0.5,                        # rpc, in range 0.0..1.0
+# ssl_ciphers = None,                                      # ssl, optional str
+# ssl_protocol = None,                                     # ssl, optional "SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2" or "TLS"
 # flock_id = "DEFAULT",                                    # rpc, arbitrary cage group identifier
 # marshaling_methods = ("msgpack", "pickle"),              # rpc, marshaling methods, priority ordered
 # max_packet_size = 1048576,                               # rpc, maximum allowed request/response size in bytes
 # exact_locations = { "SomeCage": "ssl://1.2.3.5:63842" }, # rpc, maps cage names to their fixed locations
+# exact_locations = { "SomeCage": { "ssl://sc1:1234", "ssl://sc2:5678" } }, # multiple locations alternative
 # )
 #
 # Pythomnic3k project
-# (c) 2005-2019, Dmitry Dvoinikov <dmitry@targeted.org>
+# (c) 2005-2020, Dmitry Dvoinikov <dmitry@targeted.org>
 # Distributed under BSD license
 #
 ###############################################################################
@@ -96,9 +101,8 @@ import select; from select import select
 import io; from io import BytesIO
 import hashlib; from hashlib import sha1
 import threading; from threading import current_thread, Lock
-import pickle; from pickle import load as unpickle, dumps as pickle
 import struct; from struct import pack, unpack
-import random; from random import randint
+import random; from random import randint, shuffle
 import ssl; from ssl import CERT_REQUIRED
 import socket; from socket import socket, AF_INET, SOCK_DGRAM, SOL_SOCKET, \
                                   SO_BROADCAST, SO_REUSEADDR, error as socket_error
@@ -108,8 +112,10 @@ except ImportError:
     have_reuse_port = False
 else:
     have_reuse_port = True
+
+import pickle
 try:
-    import umsgpack; from umsgpack import load as unmsgpack, dumps as msgpack
+    import umsgpack
 except ImportError:
     have_msgpack = False
 else:
@@ -121,7 +127,7 @@ if __name__ == "__main__": # add pythomnic/lib to sys.path
     sys.path.insert(0, os.path.normpath(os.path.join(main_module_dir, "..", "..", "lib")))
 
 import exc_string; from exc_string import exc_string
-import typecheck; from typecheck import typecheck, optional, by_regex, dict_of, tuple_of, one_of, anything
+import typecheck; from typecheck import typecheck, optional, by_regex, dict_of, tuple_of, one_of, anything, either, set_of
 import pmnc.resource_pool; from pmnc.resource_pool import TransactionalResource, ResourceError, RPCError
 import pmnc.timeout; from pmnc.timeout import Timeout
 import pmnc.threads; from pmnc.threads import HeavyThread
@@ -131,8 +137,9 @@ import pmnc.threads; from pmnc.threads import HeavyThread
 valid_cage_name = by_regex("^[A-Za-z0-9_-]{1,32}$")
 valid_node_name = by_regex("^[A-Za-z0-9_-]{1,32}$")
 valid_flock_id = by_regex("^[A-Za-z0-9_-]+$")
-valid_location = by_regex("^(ssl|tcp)://([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|\\*):[0-9]{1,5}/$")
-valid_exact_location = by_regex("^(ssl|tcp)://[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}:[0-9]{1,5}/$")
+valid_discovered_location = by_regex("^(ssl|tcp)://([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|\\*):[0-9]{1,5}/$")
+valid_exact_location = by_regex("^(ssl|tcp)://[A-Za-z0-9-]{1,32}(\\.[A-Za-z0-9-]{1,32})*:[0-9]{1,5}/?$")
+valid_exact_locations = either(valid_exact_location, set_of(valid_exact_location))
 valid_marshaling_method = one_of("pickle", "msgpack")
 valid_marshaling_methods = lambda t: tuple_of(valid_marshaling_method)(t) and len(t) > 0
 
@@ -219,12 +226,12 @@ class RpcMarshaler:
             raise Exception("packet size exceeded")
         return method, data_b
 
-    # pickle packet is historically marshaled using printable hex
+    # pickle packet was historically marshaled using printable hex
     # length | hash | pickle data
     # which is a stupid thing to do
 
     def _marshal_pickle(self, value):
-        content_b = b"PKL3" + pickle(value)
+        content_b = b"PKL3" + pickle.dumps(value, protocol = 4)
         return "{0:08X}".format(len(content_b)).encode("ascii") + \
                sha1(content_b).hexdigest().upper().encode("ascii") + \
                content_b
@@ -233,7 +240,7 @@ class RpcMarshaler:
     # length | hash | msgpack data
 
     def _marshal_msgpack(self, value):
-        content_b = b"MSGP" + msgpack(value)
+        content_b = b"MSGP" + umsgpack.dumps(value)
         return pack(">L", len(content_b)) + \
                sha1(content_b).digest() + \
                content_b
@@ -310,9 +317,9 @@ class RpcUnmarshaler:
             self._stream.seek(self._length_size + self._hash_size, SEEK_SET)
             sig_b = self._stream.read(4)
             if sig_b == b"MSGP" and "msgpack" in self._marshaling_methods:
-                return "msgpack", unmsgpack(self._stream)
+                return "msgpack", umsgpack.load(self._stream)
             elif sig_b == b"PKL3" and "pickle" in self._marshaling_methods:
-                return "pickle", unpickle(self._stream)
+                return "pickle", pickle.load(self._stream)
             else:
                 raise Exception("unsupported marshaling method")
 
@@ -325,6 +332,8 @@ class Interface: # RPC interface
                  random_port: lambda i: isinstance(i, int) and (-65500 <= i <= 65535),
                  max_connections: int,
                  broadcast_address: (str, int),
+                 ssl_ciphers: optional(str) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
                  flock_id: valid_flock_id,
                  marshaling_methods: optional(valid_marshaling_methods) = None,
                  max_packet_size: optional(int) = None,
@@ -346,8 +355,6 @@ class Interface: # RPC interface
 
         ssl_key_cert_file = _locate_key_file("key_cert.pem")
         ssl_ca_cert_file = _locate_key_file("ca_cert.pem")
-        ssl_ciphers = "HIGH:!aNULL:!MD5"
-        ssl_protocol = "TLSv1"
 
         if pmnc.request.self_test == __name__: # self-test
             self.process_request = kwargs["process_request"]
@@ -383,8 +390,8 @@ class Interface: # RPC interface
                                            max_connections = max_connections,
                                            ssl_key_cert_file = ssl_key_cert_file,
                                            ssl_ca_cert_file = ssl_ca_cert_file,
-                                           ssl_ciphers = ssl_ciphers,
-                                           ssl_protocol = ssl_protocol,
+                                           ssl_ciphers = ssl_ciphers or "HIGH:!aNULL:!MD5",
+                                           ssl_protocol = ssl_protocol or "TLSv1",
                                            required_auth_level = CERT_REQUIRED)
 
         # RPC interface is special in that it can be configured to enqueue
@@ -570,7 +577,7 @@ class Interface: # RPC interface
                 period = 0
 
             if valid_cage_name(cage) and valid_node_name(node) and \
-               1 <= period <= 3600 and valid_location(advertised_location):
+               1 <= period <= 3600 and valid_discovered_location(advertised_location):
 
                 # the advertisement should contain the URL to the cage,
                 # for example ssl://1.2.3.4:5678/ or ssl://*:5678/ the latter
@@ -751,19 +758,24 @@ class Resource(TransactionalResource): # RPC resource
                  broadcast_address: (str, int),
                  discovery_timeout: float,
                  multiple_timeout_allowance: float,
+                 ssl_ciphers: optional(str) = None,
+                 ssl_protocol: optional(one_of("SSLv23", "TLSv1", "TLSv1_1", "TLSv1_2", "TLS")) = None,
                  flock_id: valid_flock_id,
                  marshaling_methods: optional(valid_marshaling_methods) = None,
                  max_packet_size: optional(int) = None,
-                 exact_locations: dict_of(valid_cage_name, valid_exact_location),
+                 exact_locations: dict_of(valid_cage_name, valid_exact_locations),
                  pool__resource_name: valid_cage_name):
 
         TransactionalResource.__init__(self, name)
 
         self._cage_name = pool__resource_name
-        self._exact_location = exact_locations.get(self._cage_name)
+        self._exact_locations = exact_locations.get(self._cage_name)
         self._connect_timeout = discovery_timeout
 
-        if self._exact_location is None:
+        self._ssl_ciphers = ssl_ciphers or "HIGH:!aNULL:!MD5"
+        self._ssl_protocol = ssl_protocol or "TLSv1"
+
+        if self._exact_locations is None:
             broadcast_address, self._broadcast_port = broadcast_address
             self._bind_address, self._broadcast_address = broadcast_address.split("/")
             self._multiple_timeout_allowance = min(multiple_timeout_allowance, 1.0)
@@ -783,14 +795,43 @@ class Resource(TransactionalResource): # RPC resource
 
         TransactionalResource.connect(self)
 
-        # discover and establish connection
-
         connect_timeout = Timeout(min(self._connect_timeout, pmnc.request.remain))
-        if self._exact_location is None:
+
+        if self._exact_locations is None: # perform cage discovery and attempt to connect to the discovered cage
+
+            # when a cage has just been discovered from its active response,
+            # there is a good chance it is up and running, and we can connect
+
             self._tcp_resource = self._discover(connect_timeout)
-        else:
-            self._tcp_resource = self._create_tcp_resource(connect_timeout, self._exact_location)
-        self._tcp_resource.connect()
+            self._tcp_resource.connect()
+
+        else: # exact location(s) of the cage is known
+
+            if valid_exact_location(self._exact_locations):
+                exact_locations = [ self._exact_locations ]
+            else:
+                exact_locations = list(self._exact_locations)
+
+            # but when we have a static configuration, there is no way of knowing
+            # which of the cage copies is up, and for simplicity we pick one at random
+
+            shuffle(exact_locations)
+
+            for exact_location in exact_locations:
+                try:
+                    tcp_resource = self._create_tcp_resource(connect_timeout, exact_location)
+                    tcp_resource.connect()
+                except:
+                    if not connect_timeout.expired:
+                        continue # and if connect fails, we pick another one
+                    else:
+                        raise
+                else:
+                    self._tcp_resource = tcp_resource
+                    break
+            else:
+                raise Exception("unable to connect to any of the exact locations: " \
+                                "{0:s}".format(", ".join(exact_locations)))
 
         # if the connection was established over SSL, we verify
         # target cage name against the peer's SSL certificate
@@ -905,37 +946,33 @@ class Resource(TransactionalResource): # RPC resource
     ###################################
 
     @typecheck
-    def _create_tcp_resource(self, timeout: Timeout, discovered_location: valid_location,
-                             remote_addr: optional(str) = None):
+    def _create_tcp_resource(self, timeout: Timeout, exact_location: valid_exact_location):
 
-        if discovered_location[:6] in ("ssl://", "tcp://") and discovered_location[-1] == "/":
-            cage_addr, cage_port = discovered_location[6:-1].split(":")
-            if cage_addr == "*":
-                assert remote_addr is not None
-                cage_addr = remote_addr
-        else:
-            raise Exception("unsupported RPC protocol")
+        if exact_location.endswith("/"):
+            exact_location = exact_location[:-1]
+        cage_addr, cage_port = exact_location[6:].split(":")
+        cage_port = int(cage_port)
 
-        if discovered_location.startswith("ssl://"):
+        if exact_location.startswith("ssl://"):
             ssl_key_cert_file = _locate_key_file("key_cert.pem")
             ssl_ca_cert_file = _locate_key_file("ca_cert.pem")
-            ssl_ciphers = "HIGH:!aNULL:!MD5"
-            ssl_protocol = "TLSv1"
-        elif discovered_location.startswith("tcp://"):
+            ssl_ciphers = self._ssl_ciphers
+            ssl_protocol = self._ssl_protocol
+        elif exact_location.startswith("tcp://"):
             ssl_key_cert_file = None
             ssl_ca_cert_file = None
             ssl_ciphers = None
             ssl_protocol = None
 
         return pmnc.protocol_tcp.TcpResource(self._cage_name,
-                                             server_address = (cage_addr, int(cage_port)),
+                                             server_address = (cage_addr, cage_port),
                                              connect_timeout = timeout.remain,
                                              ssl_key_cert_file = ssl_key_cert_file,
                                              ssl_ca_cert_file = ssl_ca_cert_file,
                                              ssl_ciphers = ssl_ciphers,
                                              ssl_protocol = ssl_protocol,
                                              ssl_server_hostname = None,
-                                             ssl_ignore_hostname = True)
+                                             ssl_ignore_hostname = True) # cage name regex check is used instead
 
     ###################################
 
@@ -1000,7 +1037,9 @@ class Resource(TransactionalResource): # RPC resource
                                     pmnc.log.debug("received discovery response from {0:s}, cage {1:s} is at {2:s}".\
                                                    format(remote_addr, self._cage_name, discovered_location))
 
-                                received_responses[remote_addr] = discovered_location
+                                if valid_discovered_location(discovered_location):
+                                    received_responses[remote_addr] = discovered_location
+
                                 if len(received_responses) >= expected_responses:
                                     break # while select
 
@@ -1020,14 +1059,20 @@ class Resource(TransactionalResource): # RPC resource
             finally:
                 bc_socket.close()
 
-            # if more than one cage instance has been discovered,
-            # pick one at random to improve load balancing
-
             if received_responses:
+
+                # if more than one cage instance has been discovered, pick one at random to improve load balancing
+
                 remote_addrs = list(received_responses.keys())
                 remote_addr = remote_addrs[randint(0, len(remote_addrs) - 1)]
+
+                # if discovery response was scheme://*:port, use IP address from which it has been received
+
                 discovered_location = received_responses[remote_addr]
-                tcp_resource = self._create_tcp_resource(timeout, discovered_location, remote_addr)
+                exact_location = discovered_location.replace("*", remote_addr)
+
+                tcp_resource = self._create_tcp_resource(timeout, exact_location)
+
             else:
                 raise Exception("no discovery response from cage {0:s} in {1:.01f} second(s)".\
                                 format(self._cage_name, timeout.timeout))
@@ -1088,9 +1133,9 @@ def self_test():
         t, p = m("foo")
 
         assert t == "pickle"
-        assert p == b"00000011788B085646895FE0185AAD076A9FD05F9D436EE2PKL3\x80\x03X\x03\x00\x00\x00fooq\x00."
-        assert len(b"PKL3\x80\x03X\x03\x00\x00\x00fooq\x00.") == 0x00000011
-        assert sha1(b"PKL3\x80\x03X\x03\x00\x00\x00fooq\x00.").hexdigest().upper() == "788B085646895FE0185AAD076A9FD05F9D436EE2"
+        assert p == b"00000016AB5122E63D588EF3D29A2185529551EEAA522C0EPKL3\x80\x04\x95\x07\x00\x00\x00\x00\x00\x00\x00\x8c\x03foo\x94."
+        assert len(b"PKL3\x80\x04\x95\x07\x00\x00\x00\x00\x00\x00\x00\x8c\x03foo\x94.") == 0x00000016
+        assert sha1(b"PKL3\x80\x04\x95\x07\x00\x00\x00\x00\x00\x00\x00\x8c\x03foo\x94.").hexdigest().upper() == "AB5122E63D588EF3D29A2185529551EEAA522C0E"
 
         with expected(Exception("packet size exceeded")):
             RpcUnmarshaler(("msgpack", "pickle"), 1)(p)
@@ -1122,8 +1167,8 @@ def self_test():
             um(p[8:])
 
         um = RpcUnmarshaler(("pickle", ), 1024)
-        um(b"00000010389C94157D9C6C6B3F9231E3F4E2EFD3FF1271A4")
-        with expected(EOFError):
+        um(b"000000153C17DC2415549EA2F5AB236911AE937D1382D269")
+        with expected(pickle.UnpicklingError):
             um(p[48:-1])
 
         ###
@@ -1294,7 +1339,7 @@ def self_test():
                 if nodes:
                     assert len(nodes) == 1
                     loc = nodes["self_test"]
-                    assert valid_location(loc)
+                    assert valid_discovered_location(loc)
                     assert loc.endswith(":{0:d}/".format(ifc.listener_address[1]))
                     break
                 sleep(1.0)
@@ -1339,7 +1384,7 @@ def self_test():
                                                   flock_id = "UNUSED",
                                                   marshaling_methods = ("msgpack", "pickle"),
                                                   max_packet_size = 1048576,
-                                                  exact_locations = exact_locations, # same as in config file
+                                                  exact_locations = exact_locations,
                                                   pool__resource_name = "cage_exact_location")
             resource.connect()
             try:
@@ -1359,6 +1404,58 @@ def self_test():
             assert result == "been there"
 
     test_exact_location()
+
+    ###################################
+
+    def test_exact_locations():
+
+        def process_request(module, method, args, kwargs):
+            return "processed by handler"
+
+        with active_interface("rpc", **interface_config(process_request = process_request,
+                              cage_name = "cage_exact_locations", ad_periods = (1.0, ))) as ifc:
+
+            fake_request(10.0)
+
+            # wait for the cage to be advertised
+
+            nodes = ifc.get_nodes("cage_exact_locations")
+            while not nodes and not pmnc.request.expired:
+                sleep(1.0)
+                nodes = ifc.get_nodes("cage_exact_locations")
+            assert nodes, "should have advertised itself"
+
+            # then initiate connection to the now known exact address, adding two non-functional urls
+
+            exact_locations = { "cage_exact_locations": { nodes["self_test"], "ssl://never.existed:5678", "tcp://127.0.0.1:60023" } }
+
+            resource = pmnc.protocol_rpc.Resource("self_test.cage_exact_location",
+                                                  broadcast_address = ("UNUSED/UNUSED", 0),
+                                                  discovery_timeout = 3.0,
+                                                  multiple_timeout_allowance = 0.0,
+                                                  flock_id = "UNUSED",
+                                                  marshaling_methods = ("msgpack", "pickle"),
+                                                  max_packet_size = 1048576,
+                                                  exact_locations = exact_locations,
+                                                  pool__resource_name = "cage_exact_locations")
+            resource.connect()
+            try:
+                resource.begin_transaction("xid", source_module_name = __name__,
+                                           transaction_options = {}, resource_args = (),
+                                           resource_kwargs = {})
+                try:
+                    result = resource.module.method()
+                except:
+                    resource.rollback()
+                    raise
+                else:
+                    resource.commit()
+            finally:
+                resource.disconnect()
+
+            assert result == "processed by handler"
+
+    test_exact_locations()
 
     ###################################
 

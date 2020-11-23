@@ -33,7 +33,6 @@ import ssl; from ssl import wrap_socket, CERT_OPTIONAL, CERT_REQUIRED, CERT_NONE
                             SSLError, SSL_ERROR_WANT_WRITE, SSL_ERROR_WANT_READ, \
                             SSLContext, PROTOCOL_SSLv23, OP_NO_SSLv2, OP_NO_SSLv3
 import random; from random import shuffle
-import sys; from sys import version_info
 
 if __name__ == "__main__": # add pythomnic/lib to sys.path
     import os; import sys
